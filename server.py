@@ -16,6 +16,7 @@ from protocol import (
     State,
     Welcome,
     decode,
+    Denied,
 )
 
 
@@ -25,6 +26,7 @@ class PlayerSlot:
     addr: Tuple[str, int]
     paddle_y: float = 0.0
     last_input_ts: float = 0.0
+    username: str | None = None
 
 
 class GameState:
@@ -139,15 +141,28 @@ class PongServer:
                 return slot
         return None
 
+    def _find_slot_by_username(self, name: str):
+        for slot in self.slots:
+            if slot and getattr(slot, "username", None) == name:
+                return slot
+        return None
+
     def _handle_hello(self, msg: Hello, addr):
-        # Already joined?
+        # Already joined with this address?
         if self._find_slot_by_addr(addr):
             return  # ignore duplicate
+
+        # Reject if username already taken in current game
+        if self._find_slot_by_username(msg.name):  # type: ignore[attr-defined]
+            denied = Denied("username already active")
+            self.send(denied, addr)
+            print(f"Rejecting duplicate username {msg.name} from {addr}")
+            return
 
         # Find free slot
         for i in (0, 1):
             if self.slots[i] is None:
-                self.slots[i] = PlayerSlot(i, addr, paddle_y=self.game.H / 2 - self.game.PADDLE_H / 2)
+                self.slots[i] = PlayerSlot(i, addr, paddle_y=self.game.H / 2 - self.game.PADDLE_H / 2, username=msg.name)
                 welcome = Welcome(player_id=i)
                 self.send(welcome, addr)
                 print(f"Player {i} joined from {addr}")

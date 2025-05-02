@@ -22,6 +22,7 @@ class MessageType(IntEnum):
     STATE = 3
     PING = 4
     PONG = 5
+    DENIED = 6
 
 
 @dataclass
@@ -105,6 +106,15 @@ class Pong(BaseMessage):
         self.ts = ts
 
 
+@dataclass
+class Denied(BaseMessage):
+    reason: str
+
+    def __init__(self, reason: str):
+        super().__init__(MessageType.DENIED)
+        self.reason = reason
+
+
 # Mapping from MessageType to its concrete dataclass constructor
 _TYPE_TO_CLS: Dict[MessageType, Type[BaseMessage]] = {
     MessageType.HELLO: Hello,  # type: ignore[arg-type]
@@ -113,6 +123,7 @@ _TYPE_TO_CLS: Dict[MessageType, Type[BaseMessage]] = {
     MessageType.STATE: State,  # type: ignore[arg-type]
     MessageType.PING: Ping,  # type: ignore[arg-type]
     MessageType.PONG: Pong,  # type: ignore[arg-type]
+    MessageType.DENIED: Denied,  # type: ignore[arg-type]
 }
 
 def decode(raw: bytes) -> BaseMessage:

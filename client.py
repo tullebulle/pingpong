@@ -22,6 +22,7 @@ from protocol import (
     Welcome,
     decode,
 )
+from db import LocalDB
 
 
 class Gui:
@@ -96,16 +97,78 @@ class Gui:
         pygame.display.flip()
         self.clock.tick(60)
 
+    # ------------------ login helpers ------------------ #
+    def _text_input_loop(self, prompt: str, is_password: bool = False) -> str:
+        """Display a text input field and return the entered string."""
+        text = ""
+        while True:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit(0)
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_RETURN:
+                        return text
+                    elif event.key == pygame.K_BACKSPACE:
+                        text = text[:-1]
+                    elif event.key == pygame.K_ESCAPE:
+                        pygame.quit()
+                        sys.exit(0)
+                    else:
+                        if event.unicode and event.key < 256:
+                            text += event.unicode
+
+            # draw prompt
+            self.screen.fill((0, 0, 0))
+            rendered_prompt = self.font.render(prompt, True, (255, 255, 255))
+            self.screen.blit(rendered_prompt, (20, self.height // 3))
+
+            display_text = "*" * len(text) if is_password else text
+            rendered_text = self.font.render(display_text, True, (255, 255, 255))
+            self.screen.blit(rendered_text, (20, self.height // 3 + 40))
+
+            pygame.display.flip()
+            self.clock.tick(30)
+
+    def login_screen(self, db: "LocalDB") -> str:
+        """Handle login / account creation. Returns authenticated username."""
+        while True:
+            username = self._text_input_loop("Enter username:")
+            password = self._text_input_loop("Enter password:", is_password=True)
+
+            if db.verify_user(username, password):
+                # success message
+                self._show_message("User verified...")
+                return username
+
+            # If verify fails, try to create account
+            try:
+                db.add_user(username, password)
+                self._show_message("Account created! Logged in.")
+                return username
+            except ValueError:
+                # wrong password for existing user
+                self._show_message("Wrong password. Try again …", pause=1.5)
+
+    def _show_message(self, text: str, pause: float = 1.0):
+        self.screen.fill((0, 0, 0))
+        rendered = self.font.render(text, True, (255, 255, 255))
+        rect = rendered.get_rect(center=(self.width // 2, self.height // 2))
+        self.screen.blit(rendered, rect)
+        pygame.display.flip()
+        pygame.time.delay(int(pause * 1000))
+
 
 class PongClient:
-    def __init__(self, server_addr: Tuple[str, int]):
+    def __init__(self, server_addr: Tuple[str, int], username: str, gui: Gui):
         self.server_addr = server_addr
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setblocking(False)
         self.seq = 0
         self.player_id = -1
         self.state: State | None = None
-        self.gui = Gui()
+        self.gui = gui
+        self.username = username
 
     # ------------- networking helpers ------------- #
     def send(self, msg):
@@ -121,11 +184,16 @@ class PongClient:
             print("Received player id", self.player_id)
         elif msg.type == MessageType.STATE:
             self.state = msg  # type: ignore[assignment]
+        elif msg.type == MessageType.DENIED:
+            # Show error and exit
+            self.gui._show_message("Login denied: duplicate user", pause=2)
+            pygame.quit()
+            sys.exit(1)
 
     # ------------- main loop ------------- #
     def run(self):
         # handshake
-        hello = Hello(name="player")
+        hello = Hello(name=self.username)
         self.send(hello)
 
         last_paddle_y = self.gui.height / 2 - 30
@@ -153,10 +221,17 @@ class PongClient:
             else:
                 # No state yet: simple waiting screen
                 self.gui.screen.fill((0, 0, 0))
+                wait_msg = self.gui.font.render("Waiting for other player…", True, (255, 255, 255))
+                rect = wait_msg.get_rect(center=(self.gui.width // 2, self.gui.height // 2))
+                self.gui.screen.blit(wait_msg, rect)
                 pygame.display.flip()
                 self.gui.clock.tick(60)
 
 
 def run_client_main(server_ip: str, port: int = 9999):
-    client = PongClient((server_ip, port))
+    gui = Gui()
+    db = LocalDB()
+    uname = gui.login_screen(db)
+
+    client = PongClient((server_ip, port), username=uname, gui=gui)
     client.run() 

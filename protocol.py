@@ -1,0 +1,138 @@
+from __future__ import annotations
+
+"""
+Shared protocol definitions for the UDP-based pong game.
+Both client and server import this file so they always agree on
+packet format and version.
+"""
+
+import json
+import time
+from dataclasses import dataclass, asdict
+from enum import IntEnum
+from typing import Tuple, Type, Dict, Any, Union
+
+PROTOCOL_VERSION: int = 1  # Bump this whenever the wire format changes
+
+
+class MessageType(IntEnum):
+    HELLO = 0
+    WELCOME = 1
+    INPUT = 2
+    STATE = 3
+    PING = 4
+    PONG = 5
+
+
+@dataclass
+class BaseMessage:
+    """Parent class that provides encode() helper common to all messages."""
+
+    type: MessageType
+
+    def encode(self) -> bytes:
+        payload = asdict(self)
+        payload["version"] = PROTOCOL_VERSION
+        payload["type"] = int(self.type)
+        return json.dumps(payload).encode("utf-8")
+
+
+@dataclass
+class Hello(BaseMessage):
+    name: str
+
+    def __init__(self, name: str):
+        super().__init__(MessageType.HELLO)
+        self.name = name
+
+
+@dataclass
+class Welcome(BaseMessage):
+    player_id: int  # 0 (left) or 1 (right)
+
+    def __init__(self, player_id: int):
+        super().__init__(MessageType.WELCOME)
+        self.player_id = player_id
+
+
+@dataclass
+class Input(BaseMessage):
+    seq: int
+    paddle_y: float
+
+    def __init__(self, seq: int, paddle_y: float):
+        super().__init__(MessageType.INPUT)
+        self.seq = seq
+        self.paddle_y = paddle_y
+
+
+@dataclass
+class State(BaseMessage):
+    tick: int
+    ball_x: float
+    ball_y: float
+    paddle0_y: float
+    paddle1_y: float
+    score0: int
+    score1: int
+
+    def __init__(self, tick: int, ball_x: float, ball_y: float, paddle0_y: float, paddle1_y: float, score0: int, score1: int):
+        super().__init__(MessageType.STATE)
+        self.tick = tick
+        self.ball_x = ball_x
+        self.ball_y = ball_y
+        self.paddle0_y = paddle0_y
+        self.paddle1_y = paddle1_y
+        self.score0 = score0
+        self.score1 = score1
+
+
+@dataclass
+class Ping(BaseMessage):
+    ts: float
+
+    def __init__(self, ts: float | None = None):
+        super().__init__(MessageType.PING)
+        self.ts = ts if ts is not None else time.time()
+
+
+@dataclass
+class Pong(BaseMessage):
+    ts: float
+
+    def __init__(self, ts: float):
+        super().__init__(MessageType.PONG)
+        self.ts = ts
+
+
+# Mapping from MessageType to its concrete dataclass constructor
+_TYPE_TO_CLS: Dict[MessageType, Type[BaseMessage]] = {
+    MessageType.HELLO: Hello,  # type: ignore[arg-type]
+    MessageType.WELCOME: Welcome,  # type: ignore[arg-type]
+    MessageType.INPUT: Input,  # type: ignore[arg-type]
+    MessageType.STATE: State,  # type: ignore[arg-type]
+    MessageType.PING: Ping,  # type: ignore[arg-type]
+    MessageType.PONG: Pong,  # type: ignore[arg-type]
+}
+
+def decode(raw: bytes) -> BaseMessage:
+    """Convert raw UDP payload into a concrete message instance."""
+    try:
+        obj: Dict[str, Any] = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise ValueError(f"Invalid JSON packet: {exc}") from exc
+
+    if obj.get("version") != PROTOCOL_VERSION:
+        raise ValueError("Protocol version mismatch")
+
+    try:
+        mtype = MessageType(obj["type"])
+    except (KeyError, ValueError) as exc:
+        raise ValueError("Unknown or missing message type") from exc
+
+    cls = _TYPE_TO_CLS[mtype]
+
+    # Pop fields that are not dataclass members
+    payload = {k: v for k, v in obj.items() if k not in {"type", "version"}}
+
+    return cls(**payload)  # type: ignore[arg-type] 

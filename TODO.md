@@ -1,4 +1,4 @@
-## TODOS
+### TODOS
 
 
 - Ulrik: Creating accounts, keeping history, win/loss ratio, main menu, gameboard size, ball speed, randomness of angle.
@@ -7,6 +7,7 @@
 - Random player joining (when waiting in some lobby)?
 - re-ask for password upon failed loggin
 Possibly? DB, adding stuff monotonically (blockchain stuff).
+- Test cases
 
 DB for userstats is handled server side.
 

@@ -310,7 +310,6 @@ class PongClient:
             try:
                 raw, addr = self.sock.recvfrom(4096)
                 latest = raw
-                logger.debug(f"Received data from {addr} in main loop")
                 self._handle_packet(latest)
                 count += 1
             except BlockingIOError:
@@ -366,10 +365,8 @@ class PongClient:
     def _handle_packet(self, raw):
         try:
             msg = decode(raw)
-            logger.info(f"Received packet: {msg.__class__.__name__} (type={msg.type})")
             # ALWAYS update pulse time for ANY packet from server
             self.pulse_from_server_time = time.perf_counter()
-            logger.debug(f"Updated pulse_from_server_time to {self.pulse_from_server_time}")
         except ValueError as e:
             logger.error(f"Failed to decode packet: {e}")
             return
@@ -388,8 +385,6 @@ class PongClient:
             self.physics_started = False
 
         elif msg.type == MessageType.STATE:
-            logger.debug(f"Received STATE update: ball=({msg.ball_x:.1f},{msg.ball_y:.1f}), " +  # type: ignore[attr-defined]
-                         f"scores={msg.score0}-{msg.score1}")  # type: ignore[attr-defined]
             
             # Detect grace period end by tracking when ball actually moves
             current_pos = (msg.ball_x, msg.ball_y)  # type: ignore[attr-defined]
@@ -415,8 +410,6 @@ class PongClient:
             else:
                 self.opponent_username = msg.player0_username  # type: ignore[attr-defined]
             
-            if self.opponent_username:
-                logger.debug(f"Updated opponent username to: {self.opponent_username}")
             
         elif msg.type == MessageType.DENIED:
             # Check if this is a redirect message
@@ -655,15 +648,12 @@ class PongClient:
     
     def _handle_active_game(self, last_paddle_y):
         """Handle state when game is active with both players."""
-        logger.debug(f"Have game state, handling input and rendering")
         dy = self.gui.poll_input()
         if dy is not None:
-            logger.debug(f"Input detected, dy={dy}")
             last_paddle_y = max(0, min(self.gui.height - 60, last_paddle_y + dy))
             inp = Input(seq=self.seq, paddle_y=last_paddle_y)
             self.seq += 1
             self.send(inp)
-            logger.debug(f"Sent INPUT seq={self.seq-1}, paddle_y={last_paddle_y}")
         
         # Determine which username goes on which side
         if self.player_id == 0:
@@ -682,7 +672,6 @@ class PongClient:
             render_state.ball_x = self.gui.width / 2 - self.gui.ball_size / 2
             render_state.ball_y = self.gui.height / 2 - self.gui.ball_size / 2
         
-        logger.debug(f"DRAWING GAME. Grace period: {self.grace_period}")
         self.gui.draw(render_state, self.player_id, local_paddle_y=last_paddle_y, 
                      left_username=left_username, right_username=right_username)
         return last_paddle_y
@@ -708,7 +697,6 @@ class PongClient:
         logger.info("Authentication successful, entering main game loop")
         # Update server pulse time on successful auth to prevent immediate timeout
         self.pulse_from_server_time = time.perf_counter()
-        logger.debug(f"Updated pulse_from_server_time={self.pulse_from_server_time}")
         
         # Now that we're connected and authenticated, start the main game loop
         last_paddle_y = self.gui.height / 2 - 30

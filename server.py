@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from enum import Enum, IntEnum
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
+import json
 
 from protocol import (
     Denied,
@@ -245,9 +246,13 @@ class PongServer:
     def send(self, msg, addr):
         self.sock.sendto(msg.encode(), addr)
 
+    def update_authenticated_users(self):
+        # get all authenticated users from the parent process
+        if self.pipe_conn:
+            self.pipe_conn.send({"type": "get_authenticated_users"})
+            self.authenticated_users = self.pipe_conn.recv()
+
     def broadcast_state(self):
-        logger.debug(f"Broadcasting state: ball=({self.game.ball_x:.1f},{self.game.ball_y:.1f}), " + 
-                    f"scores={self.game.scores[0]}-{self.game.scores[1]}")
         
         # Get usernames from slots
         player0_username = self.slots[0].username if self.slots[0] else None
@@ -280,44 +285,32 @@ class PongServer:
             slot = self._find_slot_by_addr(addr)
             if slot:
                 slot.last_pulse_time = time.perf_counter()
-                logger.debug(f"Updated last_pulse_time for player {slot.id} to {slot.last_pulse_time}")
         except ValueError as exc:
             logger.error(f"Bad packet from {addr}: {exc}")
             return
         if msg.type == MessageType.LOGIN:
-            logger.debug(f"Handling LOGIN from {addr}")
             self._handle_login(msg, addr)  # type: ignore[arg-type]
         elif msg.type == MessageType.HELLO:
-            logger.debug(f"Handling HELLO from {addr}")
             self._handle_hello(msg, addr)
         else:
             if msg.type == MessageType.INPUT:
-                logger.debug(f"Handling INPUT from {addr}")
                 self._handle_input(msg, addr)  # type: ignore[arg-type]
             elif msg.type == MessageType.PULSE:
-                logger.debug(f"Handling PULSE from {addr}")
                 self._handle_pulse(msg, addr) 
 
     def _find_slot_by_addr(self, addr):
-        logger.debug(f"Looking for slot with addr={addr}")
         for slot in self.slots:
             if slot and slot.addr == addr:
-                logger.debug(f"Found slot with id={slot.id}")
                 return slot
-        logger.debug(f"No slot found for addr={addr}")
         return None
 
     def _find_slot_by_username(self, name: str):
-        logger.debug(f"Looking for slot with username={name}")
         for slot in self.slots:
             if slot and getattr(slot, "username", None) == name:
-                logger.debug(f"Found slot with id={slot.id}")
                 return slot
-        logger.debug(f"No slot found for username={name}")
         return None
     
     def _handle_pulse(self, msg: Pulse, addr):
-        logger.debug(f"PULSE received from {msg.username} at {addr}")
         slot = self._find_slot_by_addr(addr)
         
         # Always echo pulse back to client even if not in slot
@@ -327,6 +320,7 @@ class PongServer:
     def _handle_login(self, msg: Login, addr):
         """Handle login request and respond with success/failure."""
         logger.debug(f"Processing LOGIN request for username={msg.username} from {addr}")
+        self.update_authenticated_users()
         try:
             if self.db.verify_user(msg.username, msg.password_hash):
                 # check if user is already logged in
@@ -336,7 +330,6 @@ class PongServer:
                     logger.warning(f"User {msg.username} already authenticated from {addr}")
                 else:
                     # Login successful
-                    self.authenticated_users[addr] = msg.username
                     logger.debug(f"Added {addr} to authenticated_users with username={msg.username}")
                     result = LoginResult(success=True, message="User authenticated")
                     self.send(result, addr)
@@ -346,7 +339,6 @@ class PongServer:
                 try:
                     logger.debug(f"User {msg.username} not found, trying to create")
                     self.db.add_user(msg.username, msg.password_hash)
-                    self.authenticated_users[addr] = msg.username
                     logger.debug(f"Added {addr} to authenticated_users with username={msg.username}")
                     result = LoginResult(success=True, message="User created")
                     self.send(result, addr)
@@ -406,7 +398,7 @@ class PongServer:
             logger.info("Both players connected, resetting game state and starting countdown")
             self.game = GameState()
             self.game_running = True
-            self.start_time = time.perf_counter() + 2.0  # 2-second grace
+            self.start_time = time.perf_counter()
             self.status = LobbyStatus.ACTIVE
             
             # Notify parent process that game is starting
@@ -438,8 +430,6 @@ class PongServer:
                 packets_processed += 1
             except BlockingIOError:
                 break  # No more packets waiting
-        if packets_processed > 0:
-            logger.debug(f"Processed {packets_processed} packets this cycle")
         return packets_processed
 
     def _check_player_timeouts(self, now):
@@ -471,23 +461,23 @@ class PongServer:
                     game_over = GameOver(reason="opponent_disconnected")
                     self.send(game_over, other.addr)
             
-            # Notify parent process about game over
-            if self.pipe_conn:
-                # Send a more detailed message including the disconnected user
-                username = slot.username if slot and slot.username else "unknown"
-                addr = slot.addr if slot else None
-                self.pipe_conn.send({
-                    "type": "player_disconnected", 
-                    "player_id": player_id,
-                    "username": username,
-                    "addr": addr
-                })
-                self.status = LobbyStatus.COMPLETED
+        # Notify parent process about game over
+        if self.pipe_conn:
+            # Send a more detailed message including the disconnected user
+            username = slot.username if slot and slot.username else "unknown"
+            addr = slot.addr if slot else None
+            self.pipe_conn.send({
+                "type": "player_disconnected", 
+                "player_id": player_id,
+                "username": username,
+                "addr": addr
+            })
+            self.status = LobbyStatus.COMPLETED
         
         # Clean up this game
         if slot and slot.addr in self.authenticated_users:
-            logger.debug(f"Removing {slot.addr} from authenticated_users")
             del self.authenticated_users[slot.addr]  # Remove from authenticated list
+
         logger.debug(f"Clearing slot {player_id}")
         self.slots[player_id] = None
         self.game_running = False
@@ -509,13 +499,11 @@ class PongServer:
             
         # Grace period just ended
         if self.start_time is not None:
-            logger.info("Grace period ended, starting game physics")
             next_tick = now  # reset so we don't try to catch up
             self.start_time = None
             
         # Time to update physics
         if now >= next_tick:
-            logger.debug(f"Physics step at tick {self.game.tick}")
             self.game.step(tick_interval)
             self.broadcast_state()
             next_tick += tick_interval
@@ -566,7 +554,6 @@ class PongServer:
 
             # Check for disconnected players (once per second)
             if now - last_timeout_check > 1.0:  
-                logger.debug(f"Running timeout check after {now - last_timeout_check:.1f}s")
                 self._check_player_timeouts(now)
                 last_timeout_check = now
 
@@ -812,7 +799,6 @@ class LobbyManager:
             # Send a message to let them know they're waiting
             wait_msg = Denied("waiting_for_opponent")
             self.sock.sendto(wait_msg.encode(), addr)
-            logger.info(f"User {msg.username} still waiting for opponent")
             return
         
         # Check if user should be in a specific lobby
@@ -872,8 +858,9 @@ class LobbyManager:
                     
                     # Remove from authenticated users list if address is available
                     if addr and addr in self.authenticated_users:
-                        logger.info(f"Removing {username} from authenticated users list")
+                        print(f"Removing {addr} from authenticated_users in LOBBY MANAGER")
                         del self.authenticated_users[addr]
+                        print(f"Authenticated users after removal: {self.authenticated_users}")
                     
                     # Remove from this lobby's player list
                     if username in lobby.players:
@@ -884,6 +871,8 @@ class LobbyManager:
                     if not lobby.players:
                         logger.info(f"No players left in lobby {lobby_id}, marking for cleanup")
                         lobby.status = LobbyStatus.COMPLETED
+                elif msg.get("type") == "get_authenticated_users":
+                    lobby.pipe_conn.send(self.authenticated_users)
             
             # Check if process is still alive
             if not lobby.process.is_alive():
@@ -982,7 +971,6 @@ class LobbyManager:
         """Process a packet received on the main socket."""
         try:
             msg = decode(raw)
-            logger.info(f"Received {msg.__class__.__name__} from {addr}")
             
             # Update last activity time for this address
             if not hasattr(self, '_last_activity_times'):

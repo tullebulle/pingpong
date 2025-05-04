@@ -62,29 +62,28 @@ class ServerDB:
         self.conn.commit()
         print(f"Initialized user database at {self.db_path}")
 
-    # --------------------------------------------------- #
-    def _hash(self, plain: str) -> str:
-        return hashlib.sha256(plain.encode()).hexdigest()
+
+
 
     # --------------------------------------------------- #
-    def add_user(self, username: str, password_plain: str) -> None:
+    def add_user(self, username: str, password_hash: str) -> None:
         try:
             with self.conn:
                 self.conn.execute(
                     "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-                    (username, self._hash(password_plain)),
+                    (username, password_hash),
                 )
         except sqlite3.IntegrityError:
             raise ValueError("Username already exists")
 
-    def verify_user(self, username: str, password_plain: str) -> bool:
+    def verify_user(self, username: str, password_hash: str) -> bool:
         cur = self.conn.execute(
             "SELECT password_hash FROM users WHERE username = ?", (username,)
         )
         row = cur.fetchone()
         if not row:
             return False
-        return row[0] == self._hash(password_plain)
+        return row[0] == password_hash
 
     # --------------------------------------------------- #
     def record_game(self, username: str, win: bool) -> None:
@@ -278,7 +277,7 @@ class PongServer:
         """Handle login request and respond with success/failure."""
         logger.debug(f"Processing LOGIN request for username={msg.username} from {addr}")
         try:
-            if self.db.verify_user(msg.username, msg.password):
+            if self.db.verify_user(msg.username, msg.password_hash):
                 # check if user is already logged in
                 if self._find_slot_by_username(msg.username):
                     result = LoginResult(success=False, message="User already authenticated")
@@ -295,7 +294,7 @@ class PongServer:
                 # Try creating user if not exists
                 try:
                     logger.debug(f"User {msg.username} not found, trying to create")
-                    self.db.add_user(msg.username, msg.password)
+                    self.db.add_user(msg.username, msg.password_hash)
                     self.authenticated_users[addr] = msg.username
                     logger.debug(f"Added {addr} to authenticated_users with username={msg.username}")
                     result = LoginResult(success=True, message="User created")
@@ -367,8 +366,22 @@ class PongServer:
         logger.debug(f"Updated player {slot.id} paddle_y={slot.paddle_y}, last_pulse_time={slot.last_pulse_time}")
         self.game.paddles[slot.id] = slot.paddle_y
 
-    def check_disconnected_players(self):
-        now = time.perf_counter()
+    def _process_network_packets(self):
+        """Process all pending network packets in the UDP receive buffer."""
+        packets_processed = 0
+        while packets_processed < 100:  # Safety limit to prevent infinite loop
+            try:
+                data, addr = self.sock.recvfrom(4096)
+                self.handle_packet(data, addr)
+                packets_processed += 1
+            except BlockingIOError:
+                break  # No more packets waiting
+        if packets_processed > 0:
+            logger.debug(f"Processed {packets_processed} packets this cycle")
+        return packets_processed
+
+    def _check_player_timeouts(self, now):
+        """Check for disconnected players."""
         logger.debug("Checking for disconnected players")
         for i, slot in enumerate(self.slots):
             if slot and now - slot.last_pulse_time > PLAYER_TIMEOUT:
@@ -381,25 +394,56 @@ class PongServer:
                     logger.info(f"Giving player {i} extra time before timeout...")
                     continue
                 
-                if self.game_running:
-                    # Notify other player
-                    for other in self.slots:
-                        if other and other.id != i:
-                            logger.info(f"Notifying player {other.id} about disconnect")
-                            game_over = GameOver(reason="opponent_disconnected")
-                            self.send(game_over, other.addr)
-                
-                # Clean up this game
-                if slot.addr in self.authenticated_users:
-                    logger.debug(f"Removing {slot.addr} from authenticated_users")
-                    del self.authenticated_users[slot.addr]  # Remove from authenticated list
-                logger.debug(f"Clearing slot {i}")
-                self.slots[i] = None
-                self.game_running = False
-                logger.debug("Setting game_running=False")
-                self.game = GameState()  # reset game state
-                logger.debug("Reset game state")
+                self._handle_player_disconnect(i, slot)
                 break  # only handle one disconnect per frame
+
+    def _handle_player_disconnect(self, player_id, slot):
+        """Handle a player disconnect by cleaning up and notifying other players."""
+        if self.game_running:
+            # Notify other player
+            for other in self.slots:
+                if other and other.id != player_id:
+                    logger.info(f"Notifying player {other.id} about disconnect")
+                    game_over = GameOver(reason="opponent_disconnected")
+                    self.send(game_over, other.addr)
+        
+        # Clean up this game
+        if slot.addr in self.authenticated_users:
+            logger.debug(f"Removing {slot.addr} from authenticated_users")
+            del self.authenticated_users[slot.addr]  # Remove from authenticated list
+        logger.debug(f"Clearing slot {player_id}")
+        self.slots[player_id] = None
+        self.game_running = False
+        logger.debug("Setting game_running=False")
+        self.game = GameState()  # reset game state
+        logger.debug("Reset game state")
+
+    def _update_game_state(self, now, next_tick, tick_interval):
+        """Update game physics and broadcast state to clients."""
+        if not self.game_running:
+            return next_tick  # No changes if game isn't running
+            
+        # Grace period before physics begins
+        if self.start_time and now < self.start_time:
+            # Keep sending neutral state so clients show countdown-like pause
+            logger.debug(f"In grace period, {self.start_time - now:.1f}s remaining")
+            self.broadcast_state()
+            return next_tick
+            
+        # Grace period just ended
+        if self.start_time is not None:
+            logger.info("Grace period ended, starting game physics")
+            next_tick = now  # reset so we don't try to catch up
+            self.start_time = None
+            
+        # Time to update physics
+        if now >= next_tick:
+            logger.debug(f"Physics step at tick {self.game.tick}")
+            self.game.step(tick_interval)
+            self.broadcast_state()
+            next_tick += tick_interval
+            
+        return next_tick
 
     # ------------- main loop ------------- #
     def run(self):
@@ -410,44 +454,19 @@ class PongServer:
         logger.info("Server running, waiting for players …")
 
         while True:
-            # Process ALL pending network packets (drain the queue)
-            packets_processed = 0
-            while packets_processed < 100:  # Safety limit to prevent infinite loop
-                try:
-                    data, addr = self.sock.recvfrom(4096)
-                    self.handle_packet(data, addr)
-                    packets_processed += 1
-                except BlockingIOError:
-                    break  # No more packets waiting
-            if packets_processed > 0:
-                logger.debug(f"Processed {packets_processed} packets this cycle")
+            # Process network
+            packets_processed = self._process_network_packets()
 
             now = time.perf_counter()
 
-            # Check for disconnected players
-            # Only check timeouts once per second to reduce overhead
+            # Check for disconnected players (once per second)
             if now - last_timeout_check > 1.0:  
                 logger.debug(f"Running timeout check after {now - last_timeout_check:.1f}s")
-                self.check_disconnected_players()
+                self._check_player_timeouts(now)
                 last_timeout_check = now
 
-            if self.game_running:
-                # Grace period before physics begins
-                if self.start_time and now < self.start_time:
-                    # Keep sending neutral state so clients show countdown-like pause
-                    logger.debug(f"In grace period, {self.start_time - now:.1f}s remaining")
-                    self.broadcast_state()
-                else:
-                    if self.start_time is not None:
-                        # Grace period just ended; align the simulation schedule
-                        logger.info("Grace period ended, starting game physics")
-                        next_tick = now  # reset so we don't try to catch up
-                        self.start_time = None
-                    if now >= next_tick:
-                        logger.debug(f"Physics step at tick {self.game.tick}")
-                        self.game.step(tick_interval)
-                        self.broadcast_state()
-                        next_tick += tick_interval
+            # Update game state
+            next_tick = self._update_game_state(now, next_tick, tick_interval)
 
             # Only sleep if we're inactive (no physics and no recent packets)
             if not self.game_running and packets_processed == 0:

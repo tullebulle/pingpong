@@ -32,7 +32,7 @@ from protocol import (
 )
 
 # Constants
-PLAYER_TIMEOUT = 5.0  # seconds before considering a player disconnected
+PLAYER_TIMEOUT = 3.0  # seconds before considering a player disconnected
 LOBBY_PORT_RANGE = (10000, 20000)  # Range of ports to use for game lobbies
 MAX_LOBBIES = 50  # Maximum number of concurrent game lobbies
 
@@ -79,19 +79,21 @@ class ServerDB:
     
     def __init__(self, db_path: str | os.PathLike | None = None):
         self.db_path = Path(db_path) if db_path else DB_FILE
-        self.conn = sqlite3.connect(self.db_path)
-        self.conn.execute(_SCHEMA)
-        self.conn.commit()
+        # Create connection and initialize schema
+        with self._get_connection() as conn:
+            conn.execute(_SCHEMA)
+            conn.commit()
         print(f"Initialized user database at {self.db_path}")
 
-
-
+    def _get_connection(self):
+        """Get a new database connection. Always call this instead of reusing connections."""
+        return sqlite3.connect(self.db_path)
 
     # --------------------------------------------------- #
     def add_user(self, username: str, password_hash: str) -> None:
         try:
-            with self.conn:
-                self.conn.execute(
+            with self._get_connection() as conn:
+                conn.execute(
                     "INSERT INTO users (username, password_hash) VALUES (?, ?)",
                     (username, password_hash),
                 )
@@ -99,27 +101,29 @@ class ServerDB:
             raise ValueError("Username already exists")
 
     def verify_user(self, username: str, password_hash: str) -> bool:
-        cur = self.conn.execute(
-            "SELECT password_hash FROM users WHERE username = ?", (username,)
-        )
-        row = cur.fetchone()
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                "SELECT password_hash FROM users WHERE username = ?", (username,)
+            )
+            row = cur.fetchone()
         if not row:
             return False
         return row[0] == password_hash
 
     # --------------------------------------------------- #
     def record_game(self, username: str, win: bool) -> None:
-        with self.conn:
-            self.conn.execute(
+        with self._get_connection() as conn:
+            conn.execute(
                 "UPDATE users SET games = games + 1, wins = wins + ?, losses = losses + ? WHERE username = ?",
                 (1 if win else 0, 0 if win else 1, username,),
             )
 
     def get_stats(self, username: str) -> Tuple[int, int, int]:
-        cur = self.conn.execute(
-            "SELECT games, wins, losses FROM users WHERE username = ?", (username,)
-        )
-        row = cur.fetchone()
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                "SELECT games, wins, losses FROM users WHERE username = ?", (username,)
+            )
+            row = cur.fetchone()
         if row:
             return int(row[0]), int(row[1]), int(row[2])
         return (0, 0, 0)
@@ -200,10 +204,16 @@ class GameState:
 class PongServer:
     def __init__(self, host: str = "0.0.0.0", port: int = 9999, db_path: str | os.PathLike | None = None, pipe_conn=None, lobby_id: int = -1):
         logger.info(f"Initializing game lobby {lobby_id} on {host}:{port}")
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((host, port))
-        self.sock.setblocking(False)
-        logger.debug("Created non-blocking UDP socket")
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.bind((host, port))
+            self.sock.setblocking(False)
+            logger.debug("Created non-blocking UDP socket")
+        except OSError as e:
+            logger.error(f"Failed to bind socket on {host}:{port}: {e}")
+            if pipe_conn:
+                pipe_conn.send({"type": "error", "message": f"Socket binding failed: {e}"})
+            raise
 
         self.slots: List[Optional[PlayerSlot]] = [None, None]
         self.game = GameState()
@@ -211,11 +221,20 @@ class PongServer:
         self.start_time: float | None = None
         logger.debug("Game state initialized")
         
-        # Authentication
-        self.db = ServerDB(db_path)
-        # Mapping of authenticated clients by address
-        self.authenticated_users = {}  # addr -> username
-        logger.debug("Authentication system initialized")
+        try:
+            # Authentication
+            # Convert db_path to Path if it's a string
+            if isinstance(db_path, str):
+                db_path = Path(db_path)
+            self.db = ServerDB(db_path)
+            # Mapping of authenticated clients by address
+            self.authenticated_users = {}  # addr -> username
+            logger.debug("Authentication system initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize database: {e}")
+            if pipe_conn:
+                pipe_conn.send({"type": "error", "message": f"Database initialization failed: {e}"})
+            raise
         
         # Lobby info
         self.lobby_id = lobby_id
@@ -224,7 +243,6 @@ class PongServer:
 
     # ------------- networking helpers ------------- #
     def send(self, msg, addr):
-        logger.debug(f"Sending {msg.__class__.__name__} to {addr}")
         self.sock.sendto(msg.encode(), addr)
 
     def broadcast_state(self):
@@ -249,7 +267,6 @@ class PongServer:
         payload = state_msg.encode()
         for slot in self.slots:
             if slot is not None:
-                logger.debug(f"Sending state to player {slot.id} ({slot.addr})")
                 self.sock.sendto(payload, slot.addr)
 
     # ------------- packet dispatch ------------- #
@@ -427,7 +444,7 @@ class PongServer:
 
     def _check_player_timeouts(self, now):
         """Check for disconnected players."""
-        logger.debug("Checking for disconnected players")
+        logger.debug(f"Connected players in Lobby {self.lobby_id}: {[slot.username for slot in self.slots if slot]}")
         for i, slot in enumerate(self.slots):
             if slot and now - slot.last_pulse_time > PLAYER_TIMEOUT:
                 elapsed = now - slot.last_pulse_time
@@ -439,6 +456,8 @@ class PongServer:
                     logger.info(f"Giving player {i} extra time before timeout...")
                     continue
                 
+                # Player has definitely timed out - disconnect them
+                logger.error(f"DISCONNECTING player {i} ({slot.username}) due to timeout after {elapsed:.1f}s")
                 self._handle_player_disconnect(i, slot)
                 break  # only handle one disconnect per frame
 
@@ -454,11 +473,19 @@ class PongServer:
             
             # Notify parent process about game over
             if self.pipe_conn:
-                self.pipe_conn.send({"type": "game_over", "reason": "player_disconnected"})
+                # Send a more detailed message including the disconnected user
+                username = slot.username if slot and slot.username else "unknown"
+                addr = slot.addr if slot else None
+                self.pipe_conn.send({
+                    "type": "player_disconnected", 
+                    "player_id": player_id,
+                    "username": username,
+                    "addr": addr
+                })
                 self.status = LobbyStatus.COMPLETED
         
         # Clean up this game
-        if slot.addr in self.authenticated_users:
+        if slot and slot.addr in self.authenticated_users:
             logger.debug(f"Removing {slot.addr} from authenticated_users")
             del self.authenticated_users[slot.addr]  # Remove from authenticated list
         logger.debug(f"Clearing slot {player_id}")
@@ -553,7 +580,19 @@ class PongServer:
         logger.info(f"Game lobby {self.lobby_id} shutting down")
 
 
-# ------------------- Lobby Manager ------------------- #
+# Run a game lobby process in a separate function outside of the LobbyManager class
+def run_lobby_process(host: str, port: int, lobby_id: int, pipe_conn, db_path: str):
+    """Run a game lobby process."""
+    try:
+        # Create a new server instance with its own resources
+        lobby = PongServer(host=host, port=port, pipe_conn=pipe_conn, lobby_id=lobby_id, db_path=db_path)
+        lobby.run()
+    except Exception as e:
+        logger.error(f"Error in lobby {lobby_id}: {e}")
+        if pipe_conn:
+            pipe_conn.send({"type": "error", "message": str(e)})
+
+
 class LobbyManager:
     """Manages multiple game lobbies for concurrent Pong games."""
     
@@ -566,7 +605,10 @@ class LobbyManager:
         
         self.host = host
         self.main_port = port
-        self.db = ServerDB(db_path)
+        self.db_path = DB_FILE if db_path is None else db_path
+        # Convert Path to string to avoid pickling issues
+        self.db_path_str = str(self.db_path)
+        self.db = ServerDB(self.db_path)
         
         # Lobbies management
         self.next_lobby_id = 1
@@ -595,9 +637,10 @@ class LobbyManager:
         lobby_id = self.next_lobby_id
         self.next_lobby_id += 1
         
+        # Pass only the necessary simple data types, not complex objects
         process = multiprocessing.Process(
-            target=self._run_lobby_process,
-            args=(self.host, port, lobby_id, child_conn),
+            target=run_lobby_process,  # Use the standalone function instead of a method
+            args=(self.host, port, lobby_id, child_conn, self.db_path_str),
             daemon=True
         )
         process.start()
@@ -656,16 +699,6 @@ class LobbyManager:
         
         logger.error("Failed to find available port after 50 attempts")
         return 0
-    
-    def _run_lobby_process(self, host: str, port: int, lobby_id: int, pipe_conn):
-        """Run a game lobby process."""
-        try:
-            lobby = PongServer(host=host, port=port, pipe_conn=pipe_conn, lobby_id=lobby_id)
-            lobby.run()
-        except Exception as e:
-            logger.error(f"Error in lobby {lobby_id}: {e}")
-            if pipe_conn:
-                pipe_conn.send({"type": "error", "message": str(e)})
     
     def _send_lobby_redirect(self, addr: Tuple[str, int], port: int, lobby_id: int):
         """Send a message to the client redirecting them to the appropriate lobby."""
@@ -751,6 +784,26 @@ class LobbyManager:
         """Handle hello message by redirecting to the appropriate lobby."""
         logger.debug(f"Processing HELLO from {addr} with username={msg.username}")
         
+        # Ensure user is authenticated
+        if addr not in self.authenticated_users:
+            # Check if this user was previously authenticated but in a different lobby
+            username_exists = False
+            for a, name in self.authenticated_users.items():
+                if name == msg.username:
+                    username_exists = True
+                    break
+                    
+            if username_exists:
+                # User exists but with different address - update the mapping
+                logger.info(f"User {msg.username} reconnecting from new address {addr}")
+                self.authenticated_users[addr] = msg.username
+            else:
+                # User not authenticated at all
+                denied = Denied("authentication required")
+                self.sock.sendto(denied.encode(), addr)
+                logger.warning(f"Rejecting unauthenticated HELLO from {addr}")
+                return
+        
         # If user is in waiting list, continue waiting
         if msg.username in self.waiting_players:
             # Update the address in case it changed
@@ -771,9 +824,9 @@ class LobbyManager:
                 return
         
         # If we get here, the user isn't in a lobby and isn't waiting
-        # This is an error condition - add them to waiting list
+        # Add them to waiting list
         self.waiting_players[msg.username] = (msg.username, addr)
-        logger.warning(f"User {msg.username} not found in any lobby, adding to waiting list")
+        logger.info(f"User {msg.username} not found in any lobby, adding to waiting list")
         wait_msg = Denied("waiting_for_opponent")
         self.sock.sendto(wait_msg.encode(), addr)
     
@@ -782,6 +835,11 @@ class LobbyManager:
         # Send pulse response immediately
         return_msg = Pulse(username=msg.username)
         self.sock.sendto(return_msg.encode(), addr)
+        
+        # Update last activity time for this address
+        if not hasattr(self, '_last_activity_times'):
+            self._last_activity_times = {}
+        self._last_activity_times[addr] = time.perf_counter()
         
         # If player is waiting, update their address
         if msg.username in self.waiting_players:
@@ -806,10 +864,39 @@ class LobbyManager:
                     logger.info(f"Player {msg.get('username')} joined lobby {lobby_id} in slot {msg.get('slot')}")
                     if msg.get('username') not in lobby.players:
                         lobby.players.append(msg.get('username'))
+                elif msg.get("type") == "player_disconnected":
+                    username = msg.get('username')
+                    player_id = msg.get('player_id')
+                    addr = msg.get('addr')
+                    logger.info(f"Player {username} (ID: {player_id}) disconnected from lobby {lobby_id}")
+                    
+                    # Remove from authenticated users list if address is available
+                    if addr and addr in self.authenticated_users:
+                        logger.info(f"Removing {username} from authenticated users list")
+                        del self.authenticated_users[addr]
+                    
+                    # Remove from this lobby's player list
+                    if username in lobby.players:
+                        lobby.players.remove(username)
+                        logger.info(f"Removed {username} from lobby {lobby_id} player list")
+                    
+                    # If both players are gone, mark lobby for cleanup
+                    if not lobby.players:
+                        logger.info(f"No players left in lobby {lobby_id}, marking for cleanup")
+                        lobby.status = LobbyStatus.COMPLETED
             
             # Check if process is still alive
             if not lobby.process.is_alive():
                 logger.warning(f"Lobby {lobby_id} process died unexpectedly")
+                
+                # Remove any players in this lobby from authenticated users
+                for player in lobby.players:
+                    # Find their address in the authenticated_users dict
+                    for addr, username in list(self.authenticated_users.items()):
+                        if username == player:
+                            logger.info(f"Removing {player} from authenticated users due to dead lobby")
+                            del self.authenticated_users[addr]
+                
                 lobbies_to_remove.append(lobby_id)
                 continue
             
@@ -822,26 +909,85 @@ class LobbyManager:
         
         # Clean up lobbies that need removal
         for lobby_id in lobbies_to_remove:
-            lobby = self.lobbies[lobby_id]
-            try:
-                if lobby.pipe_conn:
-                    lobby.pipe_conn.send({"type": "shutdown"})
-                    lobby.pipe_conn.close()
-                if lobby.process.is_alive():
-                    lobby.process.join(timeout=1.0)
-                    if lobby.process.is_alive():
-                        logger.warning(f"Lobby {lobby_id} process didn't terminate, killing")
-                        lobby.process.terminate()
-            except Exception as e:
-                logger.error(f"Error cleaning up lobby {lobby_id}: {e}")
-            del self.lobbies[lobby_id]
-            logger.info(f"Removed lobby {lobby_id}")
+            self._cleanup_lobby(lobby_id)
     
+    def _cleanup_lobby(self, lobby_id):
+        """Clean up resources for a lobby that's no longer needed."""
+        if lobby_id not in self.lobbies:
+            return
+            
+        lobby = self.lobbies[lobby_id]
+        try:
+            if lobby.pipe_conn:
+                lobby.pipe_conn.send({"type": "shutdown"})
+                lobby.pipe_conn.close()
+            if lobby.process.is_alive():
+                lobby.process.join(timeout=1.0)
+                if lobby.process.is_alive():
+                    logger.warning(f"Lobby {lobby_id} process didn't terminate, killing")
+                    lobby.process.terminate()
+        except Exception as e:
+            logger.error(f"Error cleaning up lobby {lobby_id}: {e}")
+        
+        # Make sure any remaining players are removed from authenticated list
+        for player in lobby.players:
+            # Find their address in the authenticated_users dict
+            for addr, username in list(self.authenticated_users.items()):
+                if username == player:
+                    logger.info(f"Removing {player} from authenticated users during cleanup")
+                    del self.authenticated_users[addr]
+        
+        del self.lobbies[lobby_id]
+        logger.info(f"Removed lobby {lobby_id}")
+        
+    def _check_waiting_players(self):
+        """Check for inactive waiting players and remove them."""
+        # Track the last time we received any communication from waiting players
+        current_time = time.perf_counter()
+        waiting_players_to_remove = []
+        
+        # Log the current waiting list
+        if self.waiting_players:
+            logger.debug(f"Current waiting players: {list(self.waiting_players.keys())}")
+        
+        # Check each waiting player's last activity time
+        for username, (_, addr) in self.waiting_players.items():
+            # Look up when we last heard from this address
+            last_activity = getattr(self, '_last_activity_times', {}).get(addr, 0)
+            if last_activity == 0:
+                # First time seeing this player, initialize activity time
+                if not hasattr(self, '_last_activity_times'):
+                    self._last_activity_times = {}
+                self._last_activity_times[addr] = current_time
+            elif current_time - last_activity > PLAYER_TIMEOUT * 2:
+                # More than double the timeout with no activity - player likely disconnected
+                logger.warning(f"Waiting player {username} at {addr} inactive for {current_time - last_activity:.1f}s, removing")
+                waiting_players_to_remove.append(username)
+                
+                # Also remove from authenticated users
+                if addr in self.authenticated_users:
+                    logger.info(f"Removing {username} from authenticated users due to inactivity")
+                    del self.authenticated_users[addr]
+                
+                # Remove from activity tracking
+                if addr in self._last_activity_times:
+                    del self._last_activity_times[addr]
+        
+        # Remove inactive waiting players
+        for username in waiting_players_to_remove:
+            if username in self.waiting_players:
+                del self.waiting_players[username]
+
     def _handle_packet(self, raw: bytes, addr: Tuple[str, int]):
         """Process a packet received on the main socket."""
         try:
             msg = decode(raw)
             logger.info(f"Received {msg.__class__.__name__} from {addr}")
+            
+            # Update last activity time for this address
+            if not hasattr(self, '_last_activity_times'):
+                self._last_activity_times = {}
+            self._last_activity_times[addr] = time.perf_counter()
         except ValueError as e:
             logger.error(f"Failed to decode packet from {addr}: {e}")
             return
@@ -861,6 +1007,7 @@ class LobbyManager:
         logger.info("Lobby manager running")
         
         last_check_time = time.perf_counter()
+        last_waiting_check_time = time.perf_counter()
         
         while True:
             # Process incoming packets
@@ -876,6 +1023,11 @@ class LobbyManager:
             if now - last_check_time > 1.0:  # Check every second
                 self._check_lobby_status()
                 last_check_time = now
+                
+            # Check for inactive waiting players less frequently
+            if now - last_waiting_check_time > 5.0:  # Check every 5 seconds
+                self._check_waiting_players()
+                last_waiting_check_time = now
                 
             # Sleep a tiny bit to avoid 100% CPU
             time.sleep(0.001)

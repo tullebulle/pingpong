@@ -1,4 +1,4 @@
-# UDP Pong Game - Engineering Notebook
+# Pong Game - Engineering Notebook
 
 ## Project Overview
 For our final porejct, we implemented a multiplayer `Pong' game. Users can create accounts and play against other users selected from a queue of users currently waiting to play. The project includes user authentication, matchmaking, game lobbies, and a real-time physics simulation for the Pong game itself.

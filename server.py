@@ -182,6 +182,7 @@ class GameState:
         # Left paddle collision
         if self.ball_x <= self.PADDLE_W:
             if self.paddles[0] <= self.ball_y <= self.paddles[0] + self.PADDLE_H:
+                print("print", self.ball_y)
                 self.ball_x = self.PADDLE_W
                 self.ball_vx = abs(self.ball_vx)
                 self.ball_vy += self.BALL_SPEED * (random.random() - 0.5)/5
@@ -193,6 +194,7 @@ class GameState:
                 self.ball_vy += self.BALL_SPEED * (random.random() - 0.5)/5
 
         # Scoring
+        print(f"Ball position: {self.ball_x}")
         if self.ball_x < 0:
             self.scores[1] += 1
             self.reset_ball(direction=1)

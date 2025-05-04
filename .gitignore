@@ -1,2 +1,4 @@
 /venv
 /pycache
+/__pycache__
+/server.db

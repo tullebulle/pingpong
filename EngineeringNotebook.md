@@ -71,5 +71,7 @@ Security was a primary concern, addressed through password hashing using standar
 
 Several enhancements could further improve the system. Adding a spectator mode would allow users to watch ongoing games, enhancing community engagement. Implementing NAT traversal techniques would improve connectivity for users behind restrictive firewalls. Tournament functionality could create more structured competitive play. The game physics could be enhanced with more realistic paddle physics and spin effects for more nuanced gameplay. Finally, the UI could be improved with animations and sound effects to create a more engaging sensory experience.
 
-### AI statement
+## Attributions
+The game [Pong](https://en.wikipedia.org/wiki/Pong) was developed and popularize by [Atari](https://atari.com/?srsltid=AfmBOoot0ZhkFV5EbJzfy1qfKjW8kWzW0Mg9JQTdNT9AUYnnOQHB51n8).
+
 We used Cursor with Antropic AI to assist us with implement parts of the project and summarizing its features in this notebook.

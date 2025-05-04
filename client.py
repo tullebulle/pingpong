@@ -51,6 +51,22 @@ class Gui:
         self.clock = pygame.time.Clock()
         pygame.font.init()
         self.font = pygame.font.Font(None, 36)
+        self.username_font = pygame.font.Font(None, 48)  # Create font once
+        self.cached_usernames = {}  # Cache for rotated username surfaces
+        self.last_left_username = None
+        self.last_right_username = None
+
+    def _get_rotated_username_surface(self, username: str, is_left: bool) -> pygame.Surface:
+        """Get a cached rotated username surface or create a new one."""
+        cache_key = (username, is_left)
+        if cache_key in self.cached_usernames:
+            return self.cached_usernames[cache_key]
+        
+        # Create new surface if not in cache
+        username_surface = self.username_font.render(username, True, (128, 128, 128))
+        rotated_surface = pygame.transform.rotate(username_surface, 90 if is_left else -90)
+        self.cached_usernames[cache_key] = rotated_surface
+        return rotated_surface
 
     def poll_input(self) -> float | None:
         """Return new paddle y position based on user input, or None if unchanged."""
@@ -68,10 +84,9 @@ class Gui:
             return None
         return dy
 
-    def draw(self, state: State, player_id: int, local_paddle_y: float | None = None, username: str | None = None):
+    def draw(self, state: State, player_id: int, local_paddle_y: float | None = None, left_username: str | None = None, right_username: str | None = None):
         white = (255, 255, 255)
         black = (0, 0, 0)
-        gray = (128, 128, 128)
         self.screen.fill(black)
 
         # Derive paddle positions with optional local override (prediction) without
@@ -92,36 +107,39 @@ class Gui:
             (self.width - 10, paddle1_y, 10, 60),
         )
 
-        # Draw ball
-        pygame.draw.rect(
-            self.screen,
-            white,
-            (state.ball_x, state.ball_y, self.ball_size, self.ball_size),
-        )
-
         # Draw scores at the top center
         score_text = f"{state.score0} : {state.score1}"
         text_surface = self.font.render(score_text, True, white)
         text_rect = text_surface.get_rect(center=(self.width // 2, 20))
         self.screen.blit(text_surface, text_rect)
 
-        # Draw username if available
-        if username:
-            # Create a larger font for the username
-            username_font = pygame.font.Font(None, 48)
-            username_surface = username_font.render(username, True, gray)
+        # Draw usernames if available
+        if left_username:
+            # Only create/get surface if username changed
+            if left_username != self.last_left_username:
+                self.last_left_username = left_username
             
-            # Rotate and position username on the appropriate side
-            if player_id == 0:
-                # Left side - rotate 90 degrees counterclockwise
-                rotated_surface = pygame.transform.rotate(username_surface, 90)
-                username_rect = rotated_surface.get_rect(midleft=(20, self.height // 2))
-            else:
-                # Right side - rotate 90 degrees clockwise
-                rotated_surface = pygame.transform.rotate(username_surface, -90)
-                username_rect = rotated_surface.get_rect(midright=(self.width - 20, self.height // 2))
-            
+            # Get cached surface and draw it
+            rotated_surface = self._get_rotated_username_surface(left_username, True)
+            username_rect = rotated_surface.get_rect(midleft=(20, self.height // 2))
             self.screen.blit(rotated_surface, username_rect)
+
+        if right_username:
+            # Only create/get surface if username changed
+            if right_username != self.last_right_username:
+                self.last_right_username = right_username
+            
+            # Get cached surface and draw it
+            rotated_surface = self._get_rotated_username_surface(right_username, False)
+            username_rect = rotated_surface.get_rect(midright=(self.width - 20, self.height // 2))
+            self.screen.blit(rotated_surface, username_rect)
+
+        # Draw ball
+        pygame.draw.rect(
+            self.screen,
+            white,
+            (state.ball_x, state.ball_y, self.ball_size, self.ball_size),
+        )
 
         # Flip
         pygame.display.flip()
@@ -237,6 +255,7 @@ class PongClient:
         current_time = time.perf_counter()
         self.pulse_to_server_time = current_time
         self.pulse_from_server_time = current_time
+        self.opponent_username = None  # Track opponent's username
         logger.debug("Client initialized with default state")
 
     # ------------- networking helpers ------------- #
@@ -281,6 +300,15 @@ class PongClient:
                          f"scores={msg.score0}-{msg.score1}")  # type: ignore[attr-defined]
             self.state = msg  # type: ignore[assignment]
             
+            # Update opponent's username from state message
+            if self.player_id == 0:
+                self.opponent_username = msg.player1_username  # type: ignore[attr-defined]
+            else:
+                self.opponent_username = msg.player0_username  # type: ignore[attr-defined]
+            
+            if self.opponent_username:
+                logger.debug(f"Updated opponent username to: {self.opponent_username}")
+            
         elif msg.type == MessageType.DENIED:
             # Show error and exit
             reason = getattr(msg, 'reason', 'duplicate user')
@@ -294,6 +322,7 @@ class PongClient:
                 # Reset state
                 self.authenticated = False
                 self.player_id = -1
+                self.opponent_username = None
                 logger.debug("Reset authentication state")
                 
                 # Re-authenticate
@@ -332,6 +361,7 @@ class PongClient:
             # Handle game over (opponent disconnected, etc.)
             logger.info(f"Game over: {msg.reason}")  # type: ignore[attr-defined]
             self.gui.show_game_over(msg.reason)  # type: ignore[attr-defined]
+            self.opponent_username = None  # Reset opponent username on game over
 
 
     def handle_auth(self):
@@ -445,7 +475,16 @@ class PongClient:
             self.send(inp)
             logger.debug(f"Sent INPUT seq={self.seq-1}, paddle_y={last_paddle_y}")
         
-        self.gui.draw(self.state, self.player_id, local_paddle_y=last_paddle_y, username=self.username)
+        # Determine which username goes on which side
+        if self.player_id == 0:
+            left_username = self.username
+            right_username = self.opponent_username
+        else:
+            left_username = self.opponent_username
+            right_username = self.username
+            
+        self.gui.draw(self.state, self.player_id, local_paddle_y=last_paddle_y, 
+                     left_username=left_username, right_username=right_username)
         return last_paddle_y
     
     def _handle_events(self):

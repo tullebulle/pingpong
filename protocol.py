@@ -88,8 +88,10 @@ class State(BaseMessage):
     paddle1_y: float
     score0: int
     score1: int
+    player0_username: str | None = None
+    player1_username: str | None = None
 
-    def __init__(self, tick: int, ball_x: float, ball_y: float, paddle0_y: float, paddle1_y: float, score0: int, score1: int):
+    def __init__(self, tick: int, ball_x: float, ball_y: float, paddle0_y: float, paddle1_y: float, score0: int, score1: int, player0_username: str | None = None, player1_username: str | None = None):
         super().__init__(MessageType.STATE)
         self.tick = tick
         self.ball_x = ball_x
@@ -98,6 +100,8 @@ class State(BaseMessage):
         self.paddle1_y = paddle1_y
         self.score0 = score0
         self.score1 = score1
+        self.player0_username = player0_username
+        self.player1_username = player1_username
 
 
 @dataclass

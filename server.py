@@ -203,6 +203,11 @@ class PongServer:
     def broadcast_state(self):
         logger.debug(f"Broadcasting state: ball=({self.game.ball_x:.1f},{self.game.ball_y:.1f}), " + 
                     f"scores={self.game.scores[0]}-{self.game.scores[1]}")
+        
+        # Get usernames from slots
+        player0_username = self.slots[0].username if self.slots[0] else None
+        player1_username = self.slots[1].username if self.slots[1] else None
+        
         state_msg = State(
             tick=self.game.tick,
             ball_x=self.game.ball_x,
@@ -211,6 +216,8 @@ class PongServer:
             paddle1_y=self.game.paddles[1],
             score0=self.game.scores[0],
             score1=self.game.scores[1],
+            player0_username=player0_username,
+            player1_username=player1_username
         )
         payload = state_msg.encode()
         for slot in self.slots:

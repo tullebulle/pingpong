@@ -67,9 +67,10 @@ class Gui:
             return None
         return dy
 
-    def draw(self, state: State, player_id: int, local_paddle_y: float | None = None):
+    def draw(self, state: State, player_id: int, local_paddle_y: float | None = None, username: str | None = None):
         white = (255, 255, 255)
         black = (0, 0, 0)
+        gray = (128, 128, 128)
         self.screen.fill(black)
 
         # Derive paddle positions with optional local override (prediction) without
@@ -102,6 +103,24 @@ class Gui:
         text_surface = self.font.render(score_text, True, white)
         text_rect = text_surface.get_rect(center=(self.width // 2, 20))
         self.screen.blit(text_surface, text_rect)
+
+        # Draw username if available
+        if username:
+            # Create a larger font for the username
+            username_font = pygame.font.Font(None, 48)
+            username_surface = username_font.render(username, True, gray)
+            
+            # Rotate and position username on the appropriate side
+            if player_id == 0:
+                # Left side - rotate 90 degrees counterclockwise
+                rotated_surface = pygame.transform.rotate(username_surface, 90)
+                username_rect = rotated_surface.get_rect(midleft=(20, self.height // 2))
+            else:
+                # Right side - rotate 90 degrees clockwise
+                rotated_surface = pygame.transform.rotate(username_surface, -90)
+                username_rect = rotated_surface.get_rect(midright=(self.width - 20, self.height // 2))
+            
+            self.screen.blit(rotated_surface, username_rect)
 
         # Flip
         pygame.display.flip()
@@ -420,7 +439,7 @@ class PongClient:
                     self.send(inp)
                     logger.debug(f"Sent INPUT seq={self.seq-1}, paddle_y={last_paddle_y}")
                 
-                self.gui.draw(self.state, self.player_id, local_paddle_y=last_paddle_y)
+                self.gui.draw(self.state, self.player_id, local_paddle_y=last_paddle_y, username=self.username)
             else:
                 logger.debug(f"No game state yet, showing waiting screen")
                 # No state yet: simple waiting screen

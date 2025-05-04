@@ -10,6 +10,7 @@ import socket
 import sqlite3
 import time
 import logging
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -137,7 +138,7 @@ class GameState:
         self.ball_x = self.W / 2
         self.ball_y = self.H / 2
         self.ball_vx = self.BALL_SPEED * direction
-        self.ball_vy = self.BALL_SPEED * 0.3
+        self.ball_vy = self.BALL_SPEED * (random.random() - 0.5)
 
     def step(self, dt: float) -> None:
         """Advance world simulation by dt seconds."""
@@ -157,11 +158,13 @@ class GameState:
             if self.paddles[0] <= self.ball_y <= self.paddles[0] + self.PADDLE_H:
                 self.ball_x = self.PADDLE_W
                 self.ball_vx = abs(self.ball_vx)
+                self.ball_vy += self.BALL_SPEED * (random.random() - 0.5)/5
         # Right paddle collision
         if self.ball_x + self.BALL_SZ >= self.W - self.PADDLE_W:
             if self.paddles[1] <= self.ball_y <= self.paddles[1] + self.PADDLE_H:
                 self.ball_x = self.W - self.PADDLE_W - self.BALL_SZ
                 self.ball_vx = -abs(self.ball_vx)
+                self.ball_vy += self.BALL_SPEED * (random.random() - 0.5)/5
 
         # Scoring
         if self.ball_x < 0:

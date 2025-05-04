@@ -10,8 +10,9 @@ import sys
 import threading
 import time
 import logging
+import re
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, Optional
 
 import pygame
 import hashlib
@@ -233,6 +234,25 @@ class Gui:
         pygame.quit()
         sys.exit(0)
 
+    def show_waiting_for_opponent(self):
+        """Show a message indicating the player is waiting for an opponent."""
+        self.screen.fill((0, 0, 0))
+        
+        # Main message
+        rendered = self.font.render("Waiting for an opponent...", True, (255, 255, 255))
+        rect = rendered.get_rect(center=(self.width // 2, self.height // 2))
+        self.screen.blit(rendered, rect)
+        
+        # Draw a simple animation to show activity
+        t = time.time() * 2  # Animation speed
+        dots = "." * (1 + int(t % 3))
+        rendered = self.font.render(dots, True, (255, 255, 255))
+        rect = rendered.get_rect(center=(self.width // 2, self.height // 2 + 40))
+        self.screen.blit(rendered, rect)
+        
+        pygame.display.flip()
+        self.clock.tick(10)  # Lower framerate while waiting
+
 
 class PongClient:
     def __init__(self, server_addr: Tuple[str, int], gui: Gui):
@@ -251,17 +271,26 @@ class PongClient:
         self.last_auth_attempt = time.perf_counter()
         self.last_hello_attempt = time.perf_counter()
         self.hello_sent = False  # Track if HELLO was sent
+        self.waiting_for_opponent = False  # Flag indicating if we're waiting for matchmaking
         # Initialize with current time to avoid immediate timeout
         current_time = time.perf_counter()
         self.pulse_to_server_time = current_time
         self.pulse_from_server_time = current_time
         self.opponent_username = None  # Track opponent's username
+        
+        # Lobby info
+        self.lobby_id = -1
+        self.in_lobby = False
+        self.lobby_server_addr = None
+        
         logger.debug("Client initialized with default state")
 
     # ------------- networking helpers ------------- #
     def send(self, msg):
-        logger.debug(f"Sending {msg.__class__.__name__} packet to server")
-        self.sock.sendto(msg.encode(), self.server_addr)
+        """Send a message to the current server (either main or lobby)."""
+        target_addr = self.lobby_server_addr if self.in_lobby else self.server_addr
+        logger.debug(f"Sending {msg.__class__.__name__} packet to {'lobby' if self.in_lobby else 'main'} server at {target_addr}")
+        self.sock.sendto(msg.encode(), target_addr)
         self.pulse_to_server_time = time.perf_counter()
 
     def _recv_packets(self):
@@ -269,19 +298,62 @@ class PongClient:
         latest = None
         while True:
             try:
-                raw, _ = self.sock.recvfrom(4096)
+                raw, addr = self.sock.recvfrom(4096)
                 latest = raw
-                logger.debug("Received data in main loop")
+                logger.debug(f"Received data from {addr} in main loop")
             except BlockingIOError:
                 break
         if latest:
             self._handle_packet(latest)
         return latest is not None
 
+    def _handle_redirect(self, reason: str) -> bool:
+        """Handle server redirect messages.
+        Returns True if redirect was handled, False otherwise."""
+        # Parse redirect message format: "redirect:port:lobby_id"
+        redirect_match = re.match(r"redirect:(\d+):(\d+)", reason)
+        if redirect_match:
+            port_str, lobby_id_str = redirect_match.groups()
+            try:
+                new_port = int(port_str)
+                new_lobby_id = int(lobby_id_str)
+                
+                # Store lobby information
+                host = self.server_addr[0]  # Same host, different port
+                self.lobby_server_addr = (host, new_port)
+                self.lobby_id = new_lobby_id
+                self.in_lobby = True
+                self.player_id = -1  # Reset player ID for new lobby
+                self.state = None    # Reset game state
+                self.hello_sent = False  # Need to send HELLO to new lobby
+                
+                logger.info(f"Redirecting to lobby {new_lobby_id} at {host}:{new_port}")
+                self.gui._show_message(f"Joining game lobby...", pause=0.5)
+                
+                # Send HELLO to the new lobby immediately
+                logger.info(f"Sending HELLO to lobby with username {self.username}")
+                hello = Hello(username=self.username)
+                self.send(hello)
+                self.hello_sent = True
+                self.last_hello_attempt = time.perf_counter()
+                
+                return True
+            except ValueError:
+                logger.error(f"Invalid redirect format: {reason}")
+                return False
+        
+        # Handle waiting_for_opponent message
+        if reason == "waiting_for_opponent":
+            logger.info("Waiting for opponent. In matchmaking queue.")
+            self.waiting_for_opponent = True
+            return True
+            
+        return False  # Not a redirect message
+
     def _handle_packet(self, raw):
         try:
             msg = decode(raw)
-            logger.info(f"Received packet from server: {msg.__class__.__name__} (type={msg.type})")
+            logger.info(f"Received packet: {msg.__class__.__name__} (type={msg.type})")
             # ALWAYS update pulse time for ANY packet from server
             self.pulse_from_server_time = time.perf_counter()
             logger.debug(f"Updated pulse_from_server_time to {self.pulse_from_server_time}")
@@ -293,6 +365,7 @@ class PongClient:
             logger.info(f"Assigned player_id={self.player_id}")
             # Reset hello state once WELCOME is received
             self.hello_sent = False
+            self.waiting_for_opponent = False
             logger.debug("Reset hello_sent flag")
 
         elif msg.type == MessageType.STATE:
@@ -310,7 +383,12 @@ class PongClient:
                 logger.debug(f"Updated opponent username to: {self.opponent_username}")
             
         elif msg.type == MessageType.DENIED:
-            # Show error and exit
+            # Check if this is a redirect message
+            if hasattr(msg, 'reason'):
+                if self._handle_redirect(msg.reason):
+                    return
+            
+            # If not a redirect, show error and exit
             reason = getattr(msg, 'reason', 'duplicate user')
             logger.warning(f"Received DENIED message: {reason}")
             
@@ -455,13 +533,8 @@ class PongClient:
     def _handle_waiting_for_opponent(self):
         """Handle state when waiting for another player to join."""
         # Draw waiting screen
-        self.gui.screen.fill((0, 0, 0))
-        wait_msg = self.gui.font.render("Waiting for other player...", True, (255, 255, 255))
-        rect = wait_msg.get_rect(center=(self.gui.width // 2, self.gui.height // 2))
-        self.gui.screen.blit(wait_msg, rect)
+        self.gui.show_waiting_for_opponent()
         self._handle_events()
-        pygame.display.flip()
-        self.gui.clock.tick(60)
     
     def _handle_active_game(self, last_paddle_y):
         """Handle state when game is active with both players."""
@@ -526,9 +599,14 @@ class PongClient:
                 last_paddle_y = self._handle_active_game(last_paddle_y)
             else:
                 # Waiting state
-                if self.player_id == -1:
+                if self.waiting_for_opponent:
+                    # Still in matchmaking
+                    self._handle_waiting_for_opponent()
+                elif self.player_id == -1:
+                    # Waiting for player ID assignment
                     self._handle_waiting_for_player_id()
                 else:
+                    # Waiting for game to start
                     self._handle_waiting_for_opponent()
             
             # Log frame time

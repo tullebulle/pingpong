@@ -3,7 +3,8 @@
 ## Project Overview
 For our final porejct, we implemented a multiplayer `Pong' game. Users can create accounts and play against other users selected from a queue of users currently waiting to play. The project includes user authentication, matchmaking, game lobbies, and a real-time physics simulation for the Pong game itself.
 
-### Client-Server Communication
+## Communication Protocol and Implementation
+
 In the communication between the server and the clients, there is a tradeoff between ensuring every message gets received correctly and making sure messages get received quickly. In most usecases we considered in class, it was crucial that each message is sent in full with a confirmation of receipt being returned. The message rate was reasonably low and it was acceptable if the time between sending a message and the receiver fully receiving the message was on the scale of tenths of seconds. Here, however, in the context of the game, the requirements are different. Game-relevant communication between the server and the players needs to be fast -- on the scale of hundreths of seconds -- but the consequences of singular messages getting lost or messages arriving slgihtly out of order are not too high.
 
 To make the communication in our game work efficiently and satisfy the described demand, we are using the UDP communication protocol -- instead of TCP as seen in class. This communication protocol is very common in the usecase of online games. UDP (User Datagram Protocol) consists of a client-server architecture where the server is authoritative about the game state, and clients connect to the singular server.
@@ -12,158 +13,63 @@ Since our Pong game is being player in real-time, we need to optimize for a mini
 
 When considering the specific mechanics of our implementation, we can observe how the game naturally accommodates packet loss in several ways. For instance, if a player's paddle movement input packet is lost during transmission, the resulting momentary discrepancy is quickly remedied when the next input packet arrives a fraction of a second later -- the player might notice a slight hiccup in responsiveness, but the overall gameplay continues uninterrupted. Similarly, if the server's state update packet containing ball position is lost en route to a client, the subsequent update (arriving approximately 16 milliseconds later at 60 updates per second) will correct any visual inconsistencies without meaningful gameplay impact. This inherent resilience is further enhanced by our authoritative server architecture, where the server maintains the "ground truth" of the game state, ensuring that temporary client-side deviations due to packet loss are quickly resolved. We improved this natural tolerance by implementing our tick-based game loop in `server.py`, where each frame represents a discrete advancement of game state, allowing the system to maintain consistency even when individual updates are missed. This stands in stark contrast to TCP, which would delay all subsequent updates until a lost packet is retransmitted -- creating noticeable freezes in the fast-paced gameplay environment where immediate, albeit occasionally imperfect, information is far preferable to delayed perfect information.
 
-However, we still need some methods in place to ensure reliability of the communication protocol, for example when a player disconnects. Instead of TCP's one-size-fits-all reliability approach, we use UDP since it allows us to implement reliability mechanisms particularly for our project that address the messaging reliability needs, hopefully without compromising real-time performance. We implemented the following custom reliability mechanisms:
+### Reliability mechanisms
 
-1. **Heartbeat System**: 
-   The `Pulse` message type in `protocol.py` functions as a lightweight heartbeat. Clients automatically send pulse messages every 2 seconds to indicate their active status, while the server maintains a `last_pulse_time` for each connected player. THe server's `_check_player_timeouts` method detects disconnections when no messages are received for `PLAYER_TIMEOUT` for 5 seconds. This system achieves connection state monitoring.
+However, we still need some methods in place to ensure reliability of the communication protocol, for example when a player disconnects. Instead of TCP's one-size-fits-all reliability approach, we use UDP since it allows us to implement reliability mechanisms particularly for our project that address the messaging reliability needs, hopefully without compromising real-time performance. 
 
-2. **Input Sequencing**:
-   The client assigns incrementing sequence numbers to each `Input` message (in `client.py`). The server can detect out-of-order packets by examining these sequence numbers. This allows handling of network jitter where packets arrive in a different order than sent. The server processes each input as it arrives, maintaining game flow.
+Our reliability mechanisms begin with a heartbeat system implemented through the `Pulse` message type in `protocol.py`. This functions as a lightweight alternative to TCP's connection state, where clients automatically send pulse messages every 2 seconds to indicate their active status. The server maintains a `last_pulse_time` timestamp for each connected player, and the `_check_player_timeouts` method detects disconnections when no messages are received for 5 seconds (defined by the `PLAYER_TIMEOUT` constant). This simple mechanism achieves much of the same connection monitoring that TCP provides, but with far less overhead.
 
-3. **Client-Side Prediction**:
-   The players see immediate feedback from their inputs through a prediction system in `draw()` method of `Gui` class. When a player presses a movement key, the client immediately moves their paddle locally, so while the client sends the input to the server it doesn't wait for confirmation. When server state updates arrive, any discrepancy between predicted and actual positions is reconciled. This creates responsive gameplay despite network latency by allowing local rendering ahead of server confirmation
+For handling network jitter and packet ordering issues, we implemented an input sequencing system. The client assigns incrementing sequence numbers to each `Input` message in `client.py`. When these arrive at the server potentially out of order, the sequence numbers allow proper ordering. Unlike TCP's approach of holding all packets until the correct sequence is established, our server processes each input as it arrives, maintaining game flow without interruption.
 
-4. **Authoritative Server Model**:
-   The server in the `PongServer` class maintains the definitive game state. All physics calculations are performed server-side, and with regular state broadcasts (via `broadcast_state` method) we ensure that clients eventually converge to the correct state. This prevents cheating and ensures fair gameplay while accommodating packet loss.
+Perhaps the most significant reliability enhancement for player experience is our client-side prediction system implemented in the `draw()` method of the `Gui` class. When a player presses a movement key, the client immediately updates the local display to move their paddle, while simultaneously sending the input to the server. The client doesn't wait for confirmation from the server before showing this movement, creating the illusion of immediate response regardless of network latency. When authoritative state updates arrive from the server, any discrepancies between the predicted and actual positions are smoothly reconciled. This approach represents a fundamentally different philosophy than TCP's reliable delivery model - rather than ensuring perfect information at the expense of timeliness, we accept the inherently imperfect nature of real-time communication and build mechanisms that maintain gameplay integrity despite these limitations.
 
-5. **Automatic Reconnection**:
-   Client stores authentication credentials to attempt automatic reconnection. When receiving a "authentication required" message, the client automatically re-authenticates without input from the user being needed. This maintains gameplay sessions despite temporary network interruptions.
+To establish the foundational structure of a game session without TCP's formal connection establishment, we created a lightweight Hello-Welcome handshake protocol. After authentication, the client sends a `Hello` message containing the player's username. The server validates this message, checks for duplicate usernames, and responds with a `Welcome` message that assigns a player ID (0 for left paddle, 1 for right paddle). If a `Hello` message is lost due to UDP's unreliable nature, the client has a retry mechanism that sends additional `Hello` messages if it doesn't receive a `Welcome` response within a reasonable timeframe. The server's `_handle_hello` method in `server.py` manages this process, including verification that the user is authenticated before accepting the Hello message.
 
-6. **Message Validation**:
-   All received messages are validated in the `decode()` function within `protocol.py`. Invalid or malformed packets are safely discarded with error logging. Protocol version checking ensures compatibility between client and server
+The authoritative server architecture is another cornerstone of our reliability strategy. The server in the `PongServer` class maintains the definitive game state, with all physics calculations performed server-side. Through regular state broadcasts via the `broadcast_state` method, we ensure clients eventually converge to the correct state even if some update packets are lost. This approach prevents cheating while accommodating packet loss, as each new broadcast contains the complete game state rather than just incremental changes.
 
-# Until here I have worked through it so far - going to continue soon.
+Timeout detection plays a crucial role in our UDP implementation, as neither end can rely on TCP's connection termination to know when the other has disconnected. On the server side, the `_check_player_timeouts` method periodically examines the `last_pulse_time` for each player. If a player hasn't sent any messages for longer than the timeout period, the server invokes `_handle_player_disconnect`, which notifies the remaining player, updates the game state, and potentially ends the game. On the client side, the `_check_server_timeout` method monitors a `pulse_from_server_time` timestamp that's updated whenever any message is received. If the client hasn't heard from the server for more than 5 seconds, it displays a "Server not responding" message and shuts down gracefully rather than leaving the user in an unresponsive state.
 
+To handle temporary connection disruptions, we implemented an automatic reconnection system where the client stores authentication credentials. When receiving an "authentication required" message, the client automatically re-authenticates without requiring user intervention, maintaining gameplay sessions despite brief network interruptions. This is particularly important for mobile or wireless connections where signal strength may fluctuate.
 
-7. **Compact Message Design**:
-   - Messages are designed to be small to avoid UDP fragmentation issues
-   - JSON serialization ensures human-readable protocol while maintaining reasonable size
-   - This reduces the chance of packet loss due to size constraints
+Message validation provides another layer of reliability, with all received messages validated in the `decode()` function within `protocol.py`. Invalid or malformed packets are safely discarded with appropriate error logging. Protocol version checking ensures compatibility between client and server versions, preventing issues that might arise from mismatched implementations.
 
-8. **Timeout Detection**:
-   - Both client and server implement timeout detection
-   - Client's `_check_server_timeout` method detects when server becomes unresponsive
-   - Server's `_check_player_timeouts` identifies disconnected clients
+For network efficiency, we designed our message protocol to keep packets small, avoiding UDP fragmentation issues that can occur with oversized datagrams. While we chose JSON serialization for development practicality rather than raw binary encoding, the messages remain compact enough to avoid reliability problems related to packet size. This represents a practical tradeoff between optimal efficiency and development velocity.
 
-9. **Game Loop with Fixed Timestep**:
-   - Server implements a tick-based game simulation with fixed time steps
-   - This creates deterministic behavior regardless of packet arrival timing
-   - Consistent game state updates allow clients to easily reconcile any discrepancies
+Finally, our server implements a game loop with fixed timestep simulation, creating deterministic behavior regardless of packet arrival timing. This approach ensures that the physics simulation advances consistently, making it easier for clients to reconcile any discrepancies between their predicted state and the authoritative server state.
 
-These reliability mechanisms work together to create a system that maintains the low-latency benefits of UDP while addressing its inherent reliability challenges. By selectively implementing reliability features tailored to our specific needs, we've achieved responsive gameplay without sacrificing competitive fairness.
-
-### Comparison with TCP
-
-TCP would have introduced several problems for our real-time game:
-
-1. **Head-of-Line Blocking**: When a TCP packet is lost, all subsequent packets are held until the lost packet is retransmitted and received—even if newer data has arrived and would be more useful to the application. This can cause noticeable "stuttering" in games.
-
-2. **Congestion Control**: TCP's congestion control algorithms can significantly reduce throughput after packet loss, which might be overly aggressive for game networking where maintaining a steady stream of updates is preferable.
-
-3. **Connection Overhead**: The three-way handshake for establishing connections and connection state maintenance add latency that's unnecessary for fast-paced games.
-
-### Other Considered Alternatives
-
-1. **WebSockets**: While providing a convenient API and working over standard HTTP ports, WebSockets operate over TCP, inheriting all its limitations for real-time games.
-
-2. **QUIC**: This modern protocol offers many of UDP's benefits with built-in reliability mechanisms, but at the time of development, it lacked widespread library support and would have added implementation complexity.
-
-3. **Custom Raw Sockets**: These would have offered maximum control but would introduce cross-platform compatibility issues and potential security concerns.
-
-### Implementation Challenges with UDP
-
-Choosing UDP required us to address several challenges:
-
-1. **Implementing Reliability**: We built our own message types (Hello, Pulse, Input, State) to ensure critical information is properly processed.
-
-2. **Connection State Management**: Without TCP's built-in connection management, we implemented a timeout system where clients send regular heartbeats (Pulse messages) to indicate they're still connected.
-
-3. **Packet Size Limitations**: UDP packets might be dropped if they exceed the network's MTU (Maximum Transmission Unit). We designed our protocol with compact messages to avoid fragmentation.
-
-4. **NAT Traversal**: UDP can face challenges with NAT traversal in home networks. Our server-based architecture avoids this problem by having clients initiate all connections.
-
-Overall, the benefits of UDP's low latency and lightweight nature outweighed the additional complexity required to implement custom reliability mechanisms, making it the ideal choice for our real-time Pong game.
+We considered several alternative protocols before settling on UDP. TCP would have introduced significant problems for our real-time game due to its head-of-line blocking behavior, where a single lost packet causes all subsequent packets to be held until retransmission occurs. TCP's congestion control algorithms can significantly reduce throughput after packet loss, potentially creating noticeable gameplay disruptions. WebSockets, while providing a convenient API and working over standard HTTP ports, ultimately operate over TCP and inherit these same limitations. QUIC is a modern protocol that offers many of UDP's benefits with built-in reliability mechanisms, but at the time of development, it lacked widespread library support and would have added implementation complexity. Custom raw sockets would have offered maximum control but would introduce cross-platform compatibility issues and potential security concerns.
 
 ## System Components and Implementation
 
-### 1. Network Protocol (protocol.py)
-**Challenge:** Designing a reliable communication protocol over unreliable UDP
+### Network Protocol (protocol.py)
+Designing a reliable communication protocol over unreliable UDP presented significant challenges. We created a JSON-based message protocol with a version system for backward compatibility and defined various message types (Hello, Pulse, Welcome, Input, State, etc.) using Python dataclasses. Message encoding/decoding was implemented with comprehensive error handling for malformed packets, and we added heartbeat mechanisms to maintain connection state and detect disconnections.
 
-**Implementation:**
-- Created a JSON-based message protocol with a version system for backward compatibility
-- Defined various message types (Hello, Pulse, Welcome, Input, State, etc.) using Python dataclasses
-- Implemented message encoding/decoding with error handling for malformed packets
-- Added heartbeat (Pulse) messages to maintain connection state and detect disconnections
+### Server Architecture (server.py)
+Handling multiple concurrent games and clients efficiently required careful design. We used a multi-process architecture with a central lobby manager process that creates separate game instances for pairs of players. The timeout system we implemented detects and handles disconnected players gracefully, while our port allocation system dynamically assigns game lobbies to different ports, enabling multiple simultaneous games.
 
-### 2. Server Architecture (server.py)
-**Challenge:** Handling multiple concurrent games and clients efficiently
+### Game Physics Simulation
+Creating a deterministic physics model that works reliably over a network connection was a significant challenge. We developed a simple but effective physics engine for ball movement and collisions that uses a fixed timestep simulation to ensure consistent behavior across instances. Slight randomization in ball velocity after paddle collisions adds gameplay variety without compromising predictability, and the authoritative server-side physics implementation with client-side prediction creates a responsive UI experience despite network latency.
 
-**Implementation:**
-- Used a multi-process architecture with a central lobby manager process
-- Implemented a lobby system that creates separate game instances for pairs of players
-- Designed a timeout system to detect and handle disconnected players
-- Created a port allocation system for dynamically assigning game lobbies to different ports
+### User Authentication System
+Securely authenticating users and maintaining persistence between sessions was implemented through a SQLite database that stores user credentials and game statistics. We used standard password hashing techniques for secure authentication and implemented robust session management to maintain authenticated state during gameplay. Statistical tracking for wins, losses, and total games played enhances the user experience and encourages continued engagement.
 
-### 3. Game Physics Simulation
-**Challenge:** Creating a deterministic physics model that works over a network
+### Client Implementation (client.py)
+Creating a responsive UI that gracefully handles network latency required several techniques. We used Pygame for rendering and input handling, implemented client-side prediction to hide network latency, and created input buffering to smooth out player control. The timeout detection system handles server disconnections gracefully, and our UI components for login, gameplay, and player information display create a cohesive user experience.
 
-**Implementation:**
-- Developed a simple but effective physics engine for ball movement and collisions
-- Used a fixed timestep simulation to ensure consistent behavior
-- Added slight randomization to ball velocity after paddle collisions for gameplay variety
-- Implemented authoritative server-side physics with client-side prediction for responsive UI
-
-### 4. User Authentication System
-**Challenge:** Securely authenticating users and maintaining persistence
-
-**Implementation:**
-- Created a SQLite database to store user credentials and game statistics
-- Used password hashing for secure authentication
-- Implemented session management to maintain authenticated state during gameplay
-- Added statistics tracking for wins, losses, and total games played
-
-### 5. Client Implementation (client.py)
-**Challenge:** Creating a responsive UI that handles network latency
-
-**Implementation:**
-- Used Pygame for rendering and input handling
-- Implemented client-side prediction to hide network latency
-- Created input buffering to smooth out player control
-- Added timeout detection to handle server disconnections
-- Designed UI components for login, gameplay, and displaying player information
-
-### 6. Lobby and Matchmaking System
-**Challenge:** Pairing players together efficiently and managing game lifecycle
-
-**Implementation:**
-- Created a matchmaking queue to pair waiting players
-- Implemented a lobby status system (WAITING, ACTIVE, COMPLETED)
-- Designed a process monitoring system to clean up completed games
-- Added redirect functionality to move players from the main server to game lobbies
+### Lobby and Matchmaking System
+Efficiently pairing players together and managing the game lifecycle presented interesting challenges. We created a matchmaking queue to pair waiting players, implemented a lobby status system (WAITING, ACTIVE, COMPLETED), designed a process monitoring system to clean up completed games and prevent resource leaks, and added redirect functionality to move players from the main server to game lobbies seamlessly.
 
 ## Technical Challenges and Solutions
 
-### Network Reliability
-Despite using UDP, which doesn't guarantee packet delivery, we implemented:
-- Regular heartbeat messages to detect disconnections
-- Input sequence numbers to handle packet loss and out-of-order delivery
-- Server-side authority with client prediction for smooth gameplay
+Despite using UDP, which doesn't guarantee packet delivery, we achieved remarkable reliability through several complementary approaches. Regular heartbeat messages detect disconnections quickly, input sequence numbers handle packet loss and out-of-order delivery gracefully, and our server-side authority with client prediction creates smooth gameplay even with significant network latency or packet loss.
 
-### Scalability
-The server architecture was designed for scalability:
-- Separate processes for each game to distribute CPU load
-- Dynamic port allocation for game instances
-- Resource cleanup for completed games to prevent memory leaks
+Our server architecture was specifically designed for scalability through separated processes for each game (distributing CPU load), dynamic port allocation for game instances, and automatic resource cleanup for completed games to prevent memory leaks during extended operation.
 
-### Security
-Security measures implemented:
-- Password hashing using standard cryptographic functions
-- Input validation to prevent malformed packets
-- Timeouts to prevent resource exhaustion
+Security was a primary concern, addressed through password hashing using standard cryptographic functions, thorough input validation to prevent malformed packets from causing issues, and timeout mechanisms to prevent resource exhaustion attacks.
 
 ## Future Improvements
-- Add spectator mode for watching ongoing games
-- Implement NAT traversal techniques for better connectivity
-- Add tournament functionality
-- Enhance game physics with more realistic paddle physics and spin
-- Improve UI with animations and sound effects
+
+Several enhancements could further improve the system. Adding a spectator mode would allow users to watch ongoing games, enhancing community engagement. Implementing NAT traversal techniques would improve connectivity for users behind restrictive firewalls. Tournament functionality could create more structured competitive play. The game physics could be enhanced with more realistic paddle physics and spin effects for more nuanced gameplay. Finally, the UI could be improved with animations and sound effects to create a more engaging sensory experience.
+
+### AI statement
+We used Cursor with Antropic AI to assist us with implement parts of the project and summarizing its features in this notebook.

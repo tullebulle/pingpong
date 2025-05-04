@@ -9,6 +9,7 @@ import socket
 import sys
 import threading
 import time
+import logging
 from dataclasses import dataclass
 from typing import Tuple
 
@@ -17,13 +18,22 @@ import pygame
 from protocol import (
     Hello,
     Input,
+    Login,
+    LoginResult,
     MessageType,
+    Pulse,
     State,
     Welcome,
     decode,
 )
-from db import LocalDB
 
+# Setup detailed logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s [CLIENT] %(levelname)s: %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger('pong_client')
 
 class Gui:
     """Handles rendering and input using pygame."""
@@ -130,25 +140,14 @@ class Gui:
             pygame.display.flip()
             self.clock.tick(30)
 
-    def login_screen(self, db: "LocalDB") -> str:
+    def login_screen(self) -> str:
         """Handle login / account creation. Returns authenticated username."""
         while True:
             username = self._text_input_loop("Enter username:")
             password = self._text_input_loop("Enter password:", is_password=True)
 
-            if db.verify_user(username, password):
-                # success message
-                self._show_message("User verified...")
-                return username
-
-            # If verify fails, try to create account
-            try:
-                db.add_user(username, password)
-                self._show_message("Account created! Logged in.")
-                return username
-            except ValueError:
-                # wrong password for existing user
-                self._show_message("Wrong password. Try again …", pause=1.5)
+            # Return credentials to be validated by server
+            return username, password
 
     def _show_message(self, text: str, pause: float = 1.0):
         self.screen.fill((0, 0, 0))
@@ -158,80 +157,316 @@ class Gui:
         pygame.display.flip()
         pygame.time.delay(int(pause * 1000))
 
+    def show_game_over(self, reason: str) -> None:
+        """Show game over screen and wait for keypress to exit."""
+        self.screen.fill((0, 0, 0))
+        
+        # Main message
+        rendered = self.font.render("Game Over", True, (255, 255, 255))
+        rect = rendered.get_rect(center=(self.width // 2, self.height // 3))
+        self.screen.blit(rendered, rect)
+        
+        # Reason
+        if reason == "opponent_disconnected":
+            msg = "Your opponent has disconnected"
+        else:
+            msg = reason
+            
+        rendered = self.font.render(msg, True, (255, 255, 255))
+        rect = rendered.get_rect(center=(self.width // 2, self.height // 2))
+        self.screen.blit(rendered, rect)
+        
+        # Exit prompt
+        rendered = self.font.render("Press any key to exit", True, (200, 200, 200))
+        rect = rendered.get_rect(center=(self.width // 2, self.height * 2 // 3))
+        self.screen.blit(rendered, rect)
+        
+        pygame.display.flip()
+        
+        # Wait for keypress or quit
+        waiting = True
+        while waiting:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    waiting = False
+                elif event.type == pygame.KEYDOWN:
+                    waiting = False
+        
+        pygame.quit()
+        sys.exit(0)
+
 
 class PongClient:
-    def __init__(self, server_addr: Tuple[str, int], username: str, gui: Gui):
+    def __init__(self, server_addr: Tuple[str, int], gui: Gui):
+        logger.info(f"Initializing client connecting to {server_addr}")
         self.server_addr = server_addr
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setblocking(False)
+        logger.debug("Created non-blocking UDP socket")
         self.seq = 0
         self.player_id = -1
         self.state: State | None = None
         self.gui = gui
-        self.username = username
+        self.username = None  # Will be set after authentication
+        self.password = None  # Store password for reconnection attempts
+        self.authenticated = False
+        self.last_auth_attempt = time.perf_counter()
+        self.last_hello_attempt = time.perf_counter()
+        self.hello_sent = False  # Track if HELLO was sent
+        # Initialize with current time to avoid immediate timeout
+        current_time = time.perf_counter()
+        self.pulse_to_server_time = current_time
+        self.pulse_from_server_time = current_time
+        logger.debug("Client initialized with default state")
 
     # ------------- networking helpers ------------- #
     def send(self, msg):
+        logger.debug(f"Sending {msg.__class__.__name__} packet to server")
         self.sock.sendto(msg.encode(), self.server_addr)
+        self.pulse_to_server_time = time.perf_counter()
+
 
     def _handle_packet(self, raw):
         try:
             msg = decode(raw)
-        except ValueError:
+            logger.info(f"Received packet from server: {msg.__class__.__name__} (type={msg.type})")
+            # ALWAYS update pulse time for ANY packet from server
+            self.pulse_from_server_time = time.perf_counter()
+            logger.debug(f"Updated pulse_from_server_time to {self.pulse_from_server_time}")
+        except ValueError as e:
+            logger.error(f"Failed to decode packet: {e}")
             return
         if msg.type == MessageType.WELCOME:
             self.player_id = msg.player_id  # type: ignore[attr-defined]
-            print("Received player id", self.player_id)
+            logger.info(f"Assigned player_id={self.player_id}")
+            # Reset hello state once WELCOME is received
+            self.hello_sent = False
+            logger.debug("Reset hello_sent flag")
+
         elif msg.type == MessageType.STATE:
+            logger.debug(f"Received STATE update: ball=({msg.ball_x:.1f},{msg.ball_y:.1f}), " +  # type: ignore[attr-defined]
+                         f"scores={msg.score0}-{msg.score1}")  # type: ignore[attr-defined]
             self.state = msg  # type: ignore[assignment]
+            
         elif msg.type == MessageType.DENIED:
             # Show error and exit
-            self.gui._show_message("Login denied: duplicate user", pause=2)
+            reason = getattr(msg, 'reason', 'duplicate user')
+            logger.warning(f"Received DENIED message: {reason}")
+            
+            # Special case: If server asks for re-authentication, try to re-login instead of exiting
+            if reason == "authentication required" and self.username and self.password:
+                logger.info(f"Re-authentication required. Attempting to reconnect...")
+                self.gui._show_message("Session expired. Reconnecting...", pause=0.5)
+                
+                # Reset state
+                self.authenticated = False
+                self.player_id = -1
+                logger.debug("Reset authentication state")
+                
+                # Re-authenticate
+                login_msg = Login(username=self.username, password=self.password)
+                self.send(login_msg)
+                self.last_auth_attempt = time.perf_counter()
+                logger.info("Sent re-authentication request")
+                return
+            
+            # For other denial reasons, exit the game
+            self.gui._show_message(f"Login denied: {reason}", pause=2)
+            logger.error(f"Login denied: {reason}")
             pygame.quit()
             sys.exit(1)
 
+        elif msg.type == MessageType.LOGIN_RESULT:
+            if msg.success:  # type: ignore[attr-defined]
+                logger.info(f"Login successful: {msg.message}")  # type: ignore[attr-defined]
+                self.gui._show_message(f"Login successful: {msg.message}", pause=0.5)  # type: ignore[attr-defined]
+                self.authenticated = True
+                logger.debug("Set authenticated=True")
+               
+                # Send HELLO immediately after authentication
+                logger.info(f"Sending HELLO immediately after auth with username {self.username}")
+                hello = Hello(username=self.username)
+                self.send(hello)
+                self.hello_sent = True
+                self.last_hello_attempt = time.perf_counter()
+                logger.debug(f"Set hello_sent=True, last_hello_attempt={self.last_hello_attempt}")
+            else:
+                logger.error(f"Login failed: {msg.message}")  # type: ignore[attr-defined]
+                self.gui._show_message(f"Login failed: {msg.message}", pause=2.0)  # type: ignore[attr-defined]
+                pygame.quit()
+                sys.exit(1)
+        elif msg.type == MessageType.GAME_OVER:
+            # Handle game over (opponent disconnected, etc.)
+            logger.info(f"Game over: {msg.reason}")  # type: ignore[attr-defined]
+            self.gui.show_game_over(msg.reason)  # type: ignore[attr-defined]
+
+
+    def handle_auth(self):
+        """Handle authentication and return False when completed to exit the loop."""
+        logger.debug("In handle_auth() loop")
+        # Process events
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                logger.info("Quit event received during auth")
+                pygame.quit()
+                sys.exit(0)
+        
+        # Already authenticated in a previous iteration?
+        # Now we send HELLO directly in LOGIN_RESULT handler
+        if self.authenticated:
+            logger.debug("Already authenticated, exiting auth loop")
+            return False  # Exit the authentication loop
+            
+        # Drain network to process responses
+        latest = None
+        while True:
+            try:
+                raw, _ = self.sock.recvfrom(4096)
+                latest = raw
+                logger.debug("Received data during auth loop")
+            except BlockingIOError:
+                break
+        if latest:
+            self._handle_packet(latest)
+            
+        # Display "connecting" screen
+        self.gui.screen.fill((0, 0, 0))
+        wait_msg = self.gui.font.render("Connecting to server...", True, (255, 255, 255))
+        rect = wait_msg.get_rect(center=(self.gui.width // 2, self.gui.height // 2))
+        self.gui.screen.blit(wait_msg, rect)
+        
+        # Retry login periodically
+        if time.perf_counter() - self.last_auth_attempt > 2.0 and self.username and self.password:
+            logger.info(f"Retrying LOGIN with username {self.username}")
+            login_msg = Login(username=self.username, password=self.password)
+            self.send(login_msg)
+            self.last_auth_attempt = time.perf_counter()
+            logger.debug(f"Updated last_auth_attempt={self.last_auth_attempt}")
+        
+        pygame.display.flip()
+        self.gui.clock.tick(30)
+        
+        # Continue authentication loop
+        return True
+
     # ------------- main loop ------------- #
     def run(self):
-        # handshake
-        hello = Hello(name=self.username)
-        self.send(hello)
-
+        # Authentication state
+        waiting_auth = True
+        logger.info("Starting authentication process")
+        
+        # Before handshake, need to authenticate
+        while waiting_auth:
+            waiting_auth = self.handle_auth()
+        
+        logger.info("Authentication successful, entering main game loop")
+        # Update server pulse time on successful auth to prevent immediate timeout
+        self.pulse_from_server_time = time.perf_counter()
+        logger.debug(f"Updated pulse_from_server_time={self.pulse_from_server_time}")
+        
+        # Now that we're connected and authenticated, start the main game loop
         last_paddle_y = self.gui.height / 2 - 30
         while True:
-            # Drain the socket – keep only the newest State
+            loop_start = time.perf_counter()
             latest = None
             while True:
                 try:
                     raw, _ = self.sock.recvfrom(4096)
                     latest = raw
+                    logger.debug("Received data in main loop")
                 except BlockingIOError:
                     break
             if latest:
                 self._handle_packet(latest)
 
-            dy = self.gui.poll_input()
-            if dy is not None:
-                last_paddle_y = max(0, min(self.gui.height - 60, last_paddle_y + dy))
-                inp = Input(seq=self.seq, paddle_y=last_paddle_y)
-                self.seq += 1
-                self.send(inp)
+            # Don't check for server timeout too frequently - only every 1 second
+            elapsed = time.perf_counter() - self.pulse_from_server_time
+            logger.debug(f"Time since last server response: {elapsed:.1f}s")
+            if elapsed > 5.0:
+                logger.error(f"Server not responding for {elapsed:.1f} seconds, quitting")
+                self.gui.show_game_over("Server not responding... shutting down")
+                time.sleep(2)
+                pygame.quit()
+                sys.exit(1)
+            
+            # If we're authenticated but haven't received WELCOME yet, retry HELLO
+            if self.authenticated and self.player_id == -1 and self.username:
+                # Retry every 1 second if we don't get WELCOME
+                time_since_hello = time.perf_counter() - self.last_hello_attempt
+                logger.debug(f"Time since last HELLO: {time_since_hello:.1f}s")
+                if time_since_hello > 1.0:
+                    logger.info(f"Retrying HELLO with username {self.username}")
+                    hello = Hello(username=self.username)
+                    self.send(hello)
+                    self.last_hello_attempt = time.perf_counter()
+                    logger.debug(f"Updated last_hello_attempt={self.last_hello_attempt}")
+
+            # Send a ping every 2 seconds to keep connection alive even if not moving
+            time_since_pulse = time.perf_counter() - self.pulse_to_server_time
+            logger.debug(f"Time since last outgoing pulse: {time_since_pulse:.1f}s")
+            if time_since_pulse > 2.0:
+                pulse = Pulse(username=self.username)
+                self.send(pulse)
+                logger.info(f"Sending PULSE to keep connection alive")
 
             if self.state:
+                logger.debug(f"Have game state, handling input and rendering")
+                dy = self.gui.poll_input()
+                if dy is not None:
+                    logger.debug(f"Input detected, dy={dy}")
+                    last_paddle_y = max(0, min(self.gui.height - 60, last_paddle_y + dy))
+                    inp = Input(seq=self.seq, paddle_y=last_paddle_y)
+                    self.seq += 1
+                    self.send(inp)
+                    logger.debug(f"Sent INPUT seq={self.seq-1}, paddle_y={last_paddle_y}")
+                
                 self.gui.draw(self.state, self.player_id, local_paddle_y=last_paddle_y)
             else:
+                logger.debug(f"No game state yet, showing waiting screen")
                 # No state yet: simple waiting screen
                 self.gui.screen.fill((0, 0, 0))
-                wait_msg = self.gui.font.render("Waiting for other player…", True, (255, 255, 255))
+                if self.player_id == -1:
+                    wait_msg = self.gui.font.render("Waiting for server to assign a player ID...", True, (255, 255, 255))
+                else:
+                    wait_msg = self.gui.font.render("Waiting for other player...", True, (255, 255, 255))
                 rect = wait_msg.get_rect(center=(self.gui.width // 2, self.gui.height // 2))
                 self.gui.screen.blit(wait_msg, rect)
+                
+                # Process events to prevent GUI from becoming unresponsive
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        logger.info("Quit event received during waiting")
+                        pygame.quit()
+                        sys.exit(0)
+                
                 pygame.display.flip()
                 self.gui.clock.tick(60)
+            
+            # Log frame time
+            frame_time = time.perf_counter() - loop_start
+            if frame_time > 0.02:  # Only log slow frames (>20ms)
+                logger.debug(f"Frame time: {frame_time*1000:.1f}ms")
 
 
 def run_client_main(server_ip: str, port: int = 9999):
+    logger.info(f"Starting client connecting to {server_ip}:{port}")
     gui = Gui()
-    db = LocalDB()
-    uname = gui.login_screen(db)
+    client = PongClient((server_ip, port), gui=gui)
+    
+    # Get login credentials
+    username, password = gui.login_screen()
+    logger.info(f"User entered credentials for username: {username}")
+    
+    # Send login request
+    login_msg = Login(username=username, password=password)
+    client.username = username  # Store username for later use
+    client.password = password  # Store password for reconnection attempts
+    client.last_auth_attempt = time.perf_counter()  # Track login retries
 
-    client = PongClient((server_ip, port), username=uname, gui=gui)
-    client.run() 
+    client.send(login_msg)
+    logger.info(f"Initial LOGIN sent with username {username}")
+    
+    # Give server a moment to process initial login
+    gui._show_message("Authenticating with server...", pause=0.5)
+    
+    client.run()

@@ -6,3 +6,10 @@
 - Next: Authenticating when logging in? Security and authentication lecture. Two-factor authentication?
 - Random player joining (when waiting in some lobby)?
 Possibly? DB, adding stuff monotonically (blockchain stuff).
+
+DB for userstats is handled server side.
+
+Handling disconnect?
+Handling when people leave.
+
+Handshake back and forth.

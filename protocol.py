@@ -17,12 +17,16 @@ PROTOCOL_VERSION: int = 1  # Bump this whenever the wire format changes
 
 class MessageType(IntEnum):
     HELLO = 0
-    WELCOME = 1
-    INPUT = 2
-    STATE = 3
-    PING = 4
-    PONG = 5
-    DENIED = 6
+    PULSE = 1
+    WELCOME = 2
+    INPUT = 3
+    STATE = 4
+    PING = 5
+    PONG = 6
+    DENIED = 7
+    GAME_OVER = 8
+    LOGIN = 9
+    LOGIN_RESULT = 10
 
 
 @dataclass
@@ -40,11 +44,19 @@ class BaseMessage:
 
 @dataclass
 class Hello(BaseMessage):
-    name: str
+    username: str
 
-    def __init__(self, name: str):
+    def __init__(self, username: str):
         super().__init__(MessageType.HELLO)
-        self.name = name
+        self.username = username
+
+@dataclass
+class Pulse(BaseMessage):
+    username: str
+
+    def __init__(self, username: str):
+        super().__init__(MessageType.PULSE)
+        self.username = username       
 
 
 @dataclass
@@ -115,15 +127,50 @@ class Denied(BaseMessage):
         self.reason = reason
 
 
+@dataclass
+class GameOver(BaseMessage):
+    reason: str
+
+    def __init__(self, reason: str):
+        super().__init__(MessageType.GAME_OVER)
+        self.reason = reason
+
+
+@dataclass
+class Login(BaseMessage):
+    username: str
+    password: str
+
+    def __init__(self, username: str, password: str):
+        super().__init__(MessageType.LOGIN)
+        self.username = username
+        self.password = password
+
+
+@dataclass
+class LoginResult(BaseMessage):
+    success: bool
+    message: str
+
+    def __init__(self, success: bool, message: str = ""):
+        super().__init__(MessageType.LOGIN_RESULT)
+        self.success = success
+        self.message = message
+
+
 # Mapping from MessageType to its concrete dataclass constructor
 _TYPE_TO_CLS: Dict[MessageType, Type[BaseMessage]] = {
     MessageType.HELLO: Hello,  # type: ignore[arg-type]
+    MessageType.PULSE: Pulse,  # type: ignore[arg-type]
     MessageType.WELCOME: Welcome,  # type: ignore[arg-type]
     MessageType.INPUT: Input,  # type: ignore[arg-type]
     MessageType.STATE: State,  # type: ignore[arg-type]
     MessageType.PING: Ping,  # type: ignore[arg-type]
     MessageType.PONG: Pong,  # type: ignore[arg-type]
     MessageType.DENIED: Denied,  # type: ignore[arg-type]
+    MessageType.GAME_OVER: GameOver,  # type: ignore[arg-type]
+    MessageType.LOGIN: Login,  # type: ignore[arg-type]
+    MessageType.LOGIN_RESULT: LoginResult,  # type: ignore[arg-type]
 }
 
 def decode(raw: bytes) -> BaseMessage:

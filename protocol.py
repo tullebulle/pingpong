@@ -139,12 +139,12 @@ class GameOver(BaseMessage):
 @dataclass
 class Login(BaseMessage):
     username: str
-    password: str
+    password_hash: str
 
-    def __init__(self, username: str, password: str):
+    def __init__(self, username: str, password_hash: str):
         super().__init__(MessageType.LOGIN)
         self.username = username
-        self.password = password
+        self.password_hash = password_hash
 
 
 @dataclass

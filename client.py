@@ -16,6 +16,7 @@ from typing import Tuple, Optional
 
 import pygame
 import hashlib
+from copy import copy
 
 from protocol import (
     Hello,
@@ -283,6 +284,11 @@ class PongClient:
         self.in_lobby = False
         self.lobby_server_addr = None
         
+        # Grace period detection
+        self.grace_period = True  # Assume we start in grace period
+        self.last_ball_pos = None  # Track last ball position
+        self.physics_started = False  # Flag to track when physics actually starts
+        
         logger.debug("Client initialized with default state")
 
     # ------------- networking helpers ------------- #
@@ -290,22 +296,29 @@ class PongClient:
         """Send a message to the current server (either main or lobby)."""
         target_addr = self.lobby_server_addr if self.in_lobby else self.server_addr
         logger.debug(f"Sending {msg.__class__.__name__} packet to {'lobby' if self.in_lobby else 'main'} server at {target_addr}")
-        self.sock.sendto(msg.encode(), target_addr)
-        self.pulse_to_server_time = time.perf_counter()
+        try:
+            self.sock.sendto(msg.encode(), target_addr)
+            self.pulse_to_server_time = time.perf_counter()
+        except Exception as e:
+            logger.error(f"Failed to send {msg.__class__.__name__} packet: {e}")
 
     def _recv_packets(self):
         """Process all available packets in the UDP receive buffer."""
         latest = None
-        while True:
+        count = 0
+        while count < 30:  # Process at most 30 packets per frame to prevent indefinite loops
             try:
                 raw, addr = self.sock.recvfrom(4096)
                 latest = raw
                 logger.debug(f"Received data from {addr} in main loop")
+                self._handle_packet(latest)
+                count += 1
             except BlockingIOError:
                 break
-        if latest:
-            self._handle_packet(latest)
-        return latest is not None
+            except Exception as e:
+                logger.error(f"Error receiving packet: {e}")
+                break
+        return count > 0  # Return True if at least one packet was received
 
     def _handle_redirect(self, reason: str) -> bool:
         """Handle server redirect messages.
@@ -328,7 +341,7 @@ class PongClient:
                 self.hello_sent = False  # Need to send HELLO to new lobby
                 
                 logger.info(f"Redirecting to lobby {new_lobby_id} at {host}:{new_port}")
-                self.gui._show_message(f"Joining game lobby...", pause=0.5)
+                self.gui._show_message(f"Joining game lobby {new_lobby_id}...", pause=0.5)
                 
                 # Send HELLO to the new lobby immediately
                 logger.info(f"Sending HELLO to lobby with username {self.username}")
@@ -360,6 +373,7 @@ class PongClient:
         except ValueError as e:
             logger.error(f"Failed to decode packet: {e}")
             return
+        
         if msg.type == MessageType.WELCOME:
             self.player_id = msg.player_id  # type: ignore[attr-defined]
             logger.info(f"Assigned player_id={self.player_id}")
@@ -367,10 +381,32 @@ class PongClient:
             self.hello_sent = False
             self.waiting_for_opponent = False
             logger.debug("Reset hello_sent flag")
+            
+            # Also reset grace period detection
+            self.grace_period = True
+            self.last_ball_pos = None
+            self.physics_started = False
 
         elif msg.type == MessageType.STATE:
             logger.debug(f"Received STATE update: ball=({msg.ball_x:.1f},{msg.ball_y:.1f}), " +  # type: ignore[attr-defined]
                          f"scores={msg.score0}-{msg.score1}")  # type: ignore[attr-defined]
+            
+            # Detect grace period end by tracking when ball actually moves
+            current_pos = (msg.ball_x, msg.ball_y)  # type: ignore[attr-defined]
+            
+            if self.last_ball_pos is None:
+                # First state packet, just record position
+                self.last_ball_pos = current_pos
+            elif self.grace_period and self.last_ball_pos != current_pos:
+                # Ball position changed - physics has started
+                logger.info(f"Detected physics start: ball moved from {self.last_ball_pos} to {current_pos}")
+                self.grace_period = False
+                self.physics_started = True
+            
+            # Update last ball position
+            self.last_ball_pos = current_pos
+                
+            # Update state
             self.state = msg  # type: ignore[assignment]
             
             # Update opponent's username from state message
@@ -417,24 +453,19 @@ class PongClient:
             sys.exit(1)
 
         elif msg.type == MessageType.LOGIN_RESULT:
-            if msg.success:  # type: ignore[attr-defined]
-                logger.info(f"Login successful: {msg.message}")  # type: ignore[attr-defined]
-                self.gui._show_message(f"Login successful: {msg.message}", pause=0.5)  # type: ignore[attr-defined]
+            # This is now handled in handle_auth() during the authentication phase
+            # Only handle it here if we're in the main loop (re-authentication scenario)
+            if not self.authenticated and msg.success:  # type: ignore[attr-defined]
+                logger.info(f"Re-authentication successful")
                 self.authenticated = True
-                logger.debug("Set authenticated=True")
-               
-                # Send HELLO immediately after authentication
-                logger.info(f"Sending HELLO immediately after auth with username {self.username}")
+                
+                # Send HELLO immediately after re-authentication
                 hello = Hello(username=self.username)
                 self.send(hello)
                 self.hello_sent = True
                 self.last_hello_attempt = time.perf_counter()
-                logger.debug(f"Set hello_sent=True, last_hello_attempt={self.last_hello_attempt}")
-            else:
-                logger.error(f"Login failed: {msg.message}")  # type: ignore[attr-defined]
-                self.gui._show_message(f"Login failed: {msg.message}", pause=2.0)  # type: ignore[attr-defined]
-                pygame.quit()
-                sys.exit(1)
+                logger.debug("Sent HELLO after re-authentication")
+                
         elif msg.type == MessageType.GAME_OVER:
             # Handle game over (opponent disconnected, etc.)
             logger.info(f"Game over: {msg.reason}")  # type: ignore[attr-defined]
@@ -453,22 +484,62 @@ class PongClient:
                 sys.exit(0)
         
         # Already authenticated in a previous iteration?
-        # Now we send HELLO directly in LOGIN_RESULT handler
         if self.authenticated:
             logger.debug("Already authenticated, exiting auth loop")
             return False  # Exit the authentication loop
-            
+        
         # Drain network to process responses
-        latest = None
-        while True:
+        packets_received = 0
+        while packets_received < 10:
             try:
-                raw, _ = self.sock.recvfrom(4096)
-                latest = raw
-                logger.debug("Received data during auth loop")
+                raw, addr = self.sock.recvfrom(4096)
+                try:
+                    msg = decode(raw)
+                    logger.info(f"Auth: Received {msg.__class__.__name__} packet from {addr}")
+                    
+                    # Handle authentication-related messages directly here
+                    if msg.type == MessageType.LOGIN_RESULT:
+                        if msg.success:  # type: ignore[attr-defined]
+                            logger.info(f"Login successful: {msg.message}")  # type: ignore[attr-defined]
+                            self.gui._show_message(f"Login successful: {msg.message}", pause=0.5)  # type: ignore[attr-defined]
+                            self.authenticated = True
+                            logger.debug("Set authenticated=True")
+                           
+                            # Send HELLO immediately after authentication
+                            logger.info(f"Sending HELLO immediately after auth with username {self.username}")
+                            hello = Hello(username=self.username)
+                            self.send(hello)
+                            self.hello_sent = True
+                            self.last_hello_attempt = time.perf_counter()
+                            logger.debug(f"Set hello_sent=True, last_hello_attempt={self.last_hello_attempt}")
+                            
+                            # Exit the auth loop on success
+                            return False
+                        else:
+                            logger.error(f"Login failed: {msg.message}")  # type: ignore[attr-defined]
+                            self.gui._show_message(f"Login failed: {msg.message}", pause=2.0)  # type: ignore[attr-defined]
+                            
+                            # Retry or exit
+                            if "Error:" in msg.message:  # type: ignore[attr-defined]
+                                # Server error, likely a critical issue
+                                logger.error(f"Critical server error: {msg.message}")  # type: ignore[attr-defined]
+                                pygame.quit()
+                                sys.exit(1)
+                            
+                            # For other errors, we'll retry with a new login
+                            self.last_auth_attempt = time.perf_counter() - 3.0  # Force retry soon
+                    else:
+                        # Let the regular handler take care of other messages
+                        self._handle_packet(raw)
+                except ValueError as e:
+                    logger.error(f"Failed to decode packet during auth: {e}")
+                
+                packets_received += 1
             except BlockingIOError:
                 break
-        if latest:
-            self._handle_packet(latest)
+            except Exception as e:
+                logger.error(f"Error receiving packet during auth: {e}")
+                break
             
         # Display "connecting" screen
         self.gui.screen.fill((0, 0, 0))
@@ -494,20 +565,60 @@ class PongClient:
         """Send periodic heartbeat messages to keep connection alive."""
         time_since_pulse = time.perf_counter() - self.pulse_to_server_time
         if time_since_pulse > 2.0:
-            pulse = Pulse(username=self.username)
-            self.send(pulse)
-            logger.info(f"Sending PULSE to keep connection alive")
+            # If we're authenticated but not in a lobby, or we're in a lobby but not yet assigned a player ID,
+            # send a HELLO to help with reconnection
+            if self.authenticated and (not self.in_lobby or self.player_id == -1):
+                # It's been longer than normal between messages, try sending HELLO instead of PULSE
+                logger.info(f"Sending HELLO as heartbeat (username={self.username})")
+                hello = Hello(username=self.username)
+                self.send(hello)
+                self.hello_sent = True
+                self.last_hello_attempt = time.perf_counter()
+            else:
+                # Normal pulse
+                pulse = Pulse(username=self.username)
+                self.send(pulse)
+                logger.info(f"Sending PULSE to keep connection alive")
+            
+            self.pulse_to_server_time = time.perf_counter()
     
     def _check_server_timeout(self):
         """Check if server has been unresponsive for too long."""
         elapsed = time.perf_counter() - self.pulse_from_server_time
-        if elapsed > 5.0:
+        
+        # Different thresholds based on connection state
+        if elapsed > 8.0:
+            # Hard timeout - exit the game
             logger.error(f"Server not responding for {elapsed:.1f} seconds, quitting")
             self.gui.show_game_over("Server not responding... shutting down")
             time.sleep(2)
             pygame.quit()
             sys.exit(1)
-    
+        elif elapsed > 5.0 and self.authenticated:
+            # Try resetting connection to main server
+            logger.warning(f"Server unresponsive for {elapsed:.1f} seconds, attempting reconnection")
+            
+            # Reset lobby state if we were in one
+            if self.in_lobby:
+                logger.info("Resetting lobby connection and reconnecting to main server")
+                self.in_lobby = False
+                self.lobby_server_addr = None
+                self.player_id = -1
+                self.state = None
+                self.waiting_for_opponent = False
+                
+                # Send HELLO to main server to try reconnecting
+                hello = Hello(username=self.username)
+                self.send(hello)
+                self.hello_sent = True
+                self.last_hello_attempt = time.perf_counter()
+                
+                # Reset timeout counter to give reconnection a chance
+                self.pulse_from_server_time = time.perf_counter() - 2.0  # Give 6 more seconds
+                
+                # Show a message to the user
+                self.gui._show_message("Connection issue, attempting to reconnect...", pause=1.0)
+            
     def _handle_waiting_for_player_id(self):
         """Handle state when waiting for server to assign a player ID."""
         # Retry HELLO if needed
@@ -523,7 +634,13 @@ class PongClient:
         
         # Draw waiting screen
         self.gui.screen.fill((0, 0, 0))
-        wait_msg = self.gui.font.render("Waiting for server to assign a player ID...", True, (255, 255, 255))
+        
+        # Different message depending on connection state
+        if self.in_lobby:
+            wait_msg = self.gui.font.render("Waiting for game to assign a player ID...", True, (255, 255, 255))
+        else:
+            wait_msg = self.gui.font.render("Connecting to game server...", True, (255, 255, 255))
+        
         rect = wait_msg.get_rect(center=(self.gui.width // 2, self.gui.height // 2))
         self.gui.screen.blit(wait_msg, rect)
         self._handle_events()
@@ -555,8 +672,18 @@ class PongClient:
         else:
             left_username = self.opponent_username
             right_username = self.username
-            
-        self.gui.draw(self.state, self.player_id, local_paddle_y=last_paddle_y, 
+        
+        # Create a modified state for rendering during grace period
+        render_state = self.state
+        if self.grace_period and not self.physics_started:
+            # During grace period, create a copy of state with centered ball
+            render_state = copy(self.state)
+            # Center the ball exactly
+            render_state.ball_x = self.gui.width / 2 - self.gui.ball_size / 2
+            render_state.ball_y = self.gui.height / 2 - self.gui.ball_size / 2
+        
+        logger.debug(f"DRAWING GAME. Grace period: {self.grace_period}")
+        self.gui.draw(render_state, self.player_id, local_paddle_y=last_paddle_y, 
                      left_username=left_username, right_username=right_username)
         return last_paddle_y
     
@@ -585,34 +712,54 @@ class PongClient:
         
         # Now that we're connected and authenticated, start the main game loop
         last_paddle_y = self.gui.height / 2 - 30
-        while True:
-            loop_start = time.perf_counter()
-            
-            # Network handling
-            self._recv_packets()
-            self._check_server_timeout()
-            self._send_heartbeat()
-            
-            # State handling
-            if self.state:
-                # Active game state
-                last_paddle_y = self._handle_active_game(last_paddle_y)
-            else:
-                # Waiting state
-                if self.waiting_for_opponent:
-                    # Still in matchmaking
-                    self._handle_waiting_for_opponent()
-                elif self.player_id == -1:
-                    # Waiting for player ID assignment
-                    self._handle_waiting_for_player_id()
+        
+        # Main game loop with consistent frame timing
+        target_fps = 60
+        frame_time_target = 1.0 / target_fps
+        
+        try:
+            while True:
+                loop_start = time.perf_counter()
+                
+                # Network handling
+                packets_received = self._recv_packets()
+                
+                self._check_server_timeout()
+                self._send_heartbeat()
+                
+                # State handling
+                if self.state:
+                    # Active game state
+                    last_paddle_y = self._handle_active_game(last_paddle_y)
                 else:
-                    # Waiting for game to start
-                    self._handle_waiting_for_opponent()
-            
-            # Log frame time
-            frame_time = time.perf_counter() - loop_start
-            if frame_time > 0.02:  # Only log slow frames (>20ms)
-                logger.debug(f"Frame time: {frame_time*1000:.1f}ms")
+                    # Waiting state
+                    if self.waiting_for_opponent: #WAITING IN LOBBY
+                        # Still in matchmaking
+                        self._handle_waiting_for_opponent()
+                    elif self.player_id == -1: #WAITING FOR PLAYER ID ASSIGNMENT
+                        # Waiting for player ID assignment
+                        self._handle_waiting_for_player_id()
+                    else:
+                        # Waiting for game to start
+                        self._handle_waiting_for_opponent()
+                
+                # Calculate how much time to sleep to maintain target framerate
+                elapsed = time.perf_counter() - loop_start
+                sleep_time = max(0, frame_time_target - elapsed)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                
+                # Log frame time
+                frame_time = time.perf_counter() - loop_start
+                    
+        except Exception as e:
+            logger.error(f"Error in main loop: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self.gui.show_game_over(f"Client error: {str(e)}")
+            time.sleep(2)
+            pygame.quit()
+            sys.exit(1)
 
     def _hash_password(self, password: str) -> str:
         """Hash a password using SHA-256 before sending it over the network."""

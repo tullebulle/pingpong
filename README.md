@@ -23,8 +23,8 @@ A real-time multiplayer Pong game implementation using UDP networking. This proj
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/udp-pong.git
-   cd udp-pong
+   git clone https://github.com/tullebulle/pingpong.git
+   cd pingpong
    ```
 
 2. Install the required dependencies:

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import sys
 
+import config
 from client import run_client_main
 from server import run_server_main
 
@@ -13,11 +14,11 @@ def main():
     subparsers = parser.add_subparsers(dest="role", required=True)
 
     srv = subparsers.add_parser("server", help="Run server")
-    srv.add_argument("--port", type=int, default=9999, help="UDP port to bind")
+    srv.add_argument("--port", type=int, default=config.SERVER_PORT, help="UDP port to bind")
 
     cli = subparsers.add_parser("client", help="Run client")
     cli.add_argument("host", type=str, help="Server IP or hostname")
-    cli.add_argument("--port", type=int, default=9999, help="Server UDP port")
+    cli.add_argument("--port", type=int, default=config.SERVER_PORT, help="Server UDP port")
 
     args = parser.parse_args()
 

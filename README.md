@@ -108,6 +108,34 @@ Run the test suite to verify functionality:
 python -m unittest test_pong.py
 ```
 
-## License
+## Database Management
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+The game uses SQLite with Write-Ahead Logging (WAL) mode for concurrent access from multiple game lobbies. This approach provides several benefits:
+
+- Multiple lobby processes can read and write to the database concurrently
+- Transactions are atomic and isolated
+- Automatic retry logic handles database lock contention
+- Proper error handling prevents database corruption
+
+### Database Configuration
+
+Database settings can be modified in `config.py`:
+
+- `DB_FILENAME`: Name of the SQLite database file
+- `DB_BUSY_TIMEOUT`: How long SQLite waits for a locked database before timing out (ms)
+- `DB_MAX_RETRIES`: Maximum number of retry attempts for locked database operations
+- `DB_RETRY_DELAY`: Initial delay between retries (with exponential backoff)
+
+### Testing Database Concurrency
+
+To test the database concurrency handling, run:
+
+```
+python db_concurrency_test.py
+```
+
+This simulates multiple game lobbies accessing the database simultaneously to verify that the concurrency controls are working properly.
+
+## Configuration
+
+Game settings can be modified in `config.py`.

@@ -18,6 +18,8 @@ import pygame
 import hashlib
 from copy import copy
 
+import config
+
 from protocol import (
     Hello,
     Input,
@@ -41,19 +43,19 @@ logger = logging.getLogger('pong_client')
 class Gui:
     """Handles rendering and input using pygame."""
 
-    def __init__(self, width: int = 640, height: int = 480):
+    def __init__(self, width: int = config.GAME_WIDTH, height: int = config.GAME_HEIGHT):
         pygame.init()
         self.width = width
         self.height = height
-        self.paddle_height = 60 # height of the paddle
-        self.paddle_width = 10 # width of the paddle
-        self.ball_size = 10 # size of the ball
+        self.paddle_height = config.PADDLE_HEIGHT # height of the paddle
+        self.paddle_width = config.PADDLE_WIDTH # width of the paddle
+        self.ball_size = config.BALL_SIZE # size of the ball
         self.screen = pygame.display.set_mode((width, height))
         pygame.display.set_caption("UDP Pong")
         self.clock = pygame.time.Clock()
         pygame.font.init()
-        self.font = pygame.font.Font(None, 36)
-        self.username_font = pygame.font.Font(None, 48)  # Create font once
+        self.font = pygame.font.Font(None, config.UI_DEFAULT_FONT_SIZE)
+        self.username_font = pygame.font.Font(None, config.UI_LARGE_FONT_SIZE)  # Create font once
         self.cached_usernames = {}  # Cache for rotated username surfaces
         self.last_left_username = None
         self.last_right_username = None
@@ -79,9 +81,9 @@ class Gui:
                 sys.exit(0)
         keys = pygame.key.get_pressed()
         if keys[pygame.K_UP]:
-            dy = -5
+            dy = -config.UI_PADDLE_SPEED
         elif keys[pygame.K_DOWN]:
-            dy = 5
+            dy = config.UI_PADDLE_SPEED
         if dy == 0:
             return None
         return dy
@@ -189,7 +191,7 @@ class Gui:
             # Return credentials to be validated by server
             return username, password
 
-    def _show_message(self, text: str, pause: float = 1.0):
+    def _show_message(self, text: str, pause: float = config.MESSAGE_DISPLAY_TIME):
         self.screen.fill((0, 0, 0))
         rendered = self.font.render(text, True, (255, 255, 255))
         rect = rendered.get_rect(center=(self.width // 2, self.height // 2))
@@ -197,28 +199,66 @@ class Gui:
         pygame.display.flip()
         pygame.time.delay(int(pause * 1000))
 
-    def show_game_over(self, reason: str) -> None:
+    def show_game_over(self, reason: str, player_stats: dict = None) -> None:
         """Show game over screen and wait for keypress to exit."""
         self.screen.fill((0, 0, 0))
         
-        # Main message
-        rendered = self.font.render("Game Over", True, (255, 255, 255))
-        rect = rendered.get_rect(center=(self.width // 2, self.height // 3))
+        # Main message - larger font for title
+        title_font = pygame.font.Font(None, config.UI_LARGE_FONT_SIZE)
+        rendered = title_font.render("Game Over", True, (255, 255, 255))
+        rect = rendered.get_rect(center=(self.width // 2, self.height // 4))
         self.screen.blit(rendered, rect)
+        
+        y_offset = self.height // 3
         
         # Reason
         if reason == "opponent_disconnected":
             msg = "Your opponent has disconnected"
+        elif "wins" in reason:
+            # This is a win message - display it prominently
+            msg = reason
         else:
             msg = reason
             
         rendered = self.font.render(msg, True, (255, 255, 255))
-        rect = rendered.get_rect(center=(self.width // 2, self.height // 2))
+        rect = rendered.get_rect(center=(self.width // 2, y_offset))
         self.screen.blit(rendered, rect)
+        
+        y_offset += 50
+        
+        # Display player statistics if available
+        if player_stats:
+            stats_color = (180, 180, 255)  # Light blue for stats
+            
+            # Display player statistics
+            games = player_stats.get('player_games', 0)
+            wins = player_stats.get('player_wins', 0)
+            losses = player_stats.get('player_losses', 0)
+            
+            # Calculate win percentage
+            win_percentage = 0 if games == 0 else (wins / games) * 100
+            
+            # Create stats text with newlines
+            stats_lines = [
+                f"Games:  {games}",
+                f"Wins:  {wins}",
+                f"Losses:  {losses}",
+                f"Win Rate:  {win_percentage:.1f}%"
+            ]
+            
+            # Render each line separately
+            line_height = 30
+            for line in stats_lines:
+                rendered = self.font.render(line, True, stats_color)
+                rect = rendered.get_rect(center=(self.width // 2, y_offset))
+                self.screen.blit(rendered, rect)
+                y_offset += line_height
+            
+            y_offset += 20  # Extra space after stats
         
         # Exit prompt
         rendered = self.font.render("Press any key to exit", True, (200, 200, 200))
-        rect = rendered.get_rect(center=(self.width // 2, self.height * 2 // 3))
+        rect = rendered.get_rect(center=(self.width // 2, self.height * 3 // 4))
         self.screen.blit(rendered, rect)
         
         pygame.display.flip()
@@ -462,7 +502,21 @@ class PongClient:
         elif msg.type == MessageType.GAME_OVER:
             # Handle game over (opponent disconnected, etc.)
             logger.info(f"Game over: {msg.reason}")  # type: ignore[attr-defined]
-            self.gui.show_game_over(msg.reason)  # type: ignore[attr-defined]
+            
+            # Extract player statistics and other information
+            player_stats = {
+                'winner': getattr(msg, 'winner', -1),
+                'winner_username': getattr(msg, 'winner_username', ''),
+                'score': getattr(msg, 'score', ''),
+                'player_username': getattr(msg, 'player_username', ''),
+                'opponent_username': getattr(msg, 'opponent_username', ''),
+                'player_games': getattr(msg, 'player_games', 0),
+                'player_wins': getattr(msg, 'player_wins', 0),
+                'player_losses': getattr(msg, 'player_losses', 0)
+            }
+            
+            logger.info(f"Player stats: {player_stats}")
+            self.gui.show_game_over(msg.reason, player_stats)  # type: ignore[attr-defined]
             self.opponent_username = None  # Reset opponent username on game over
 
 
@@ -483,9 +537,9 @@ class PongClient:
         
         # Drain network to process responses
         packets_received = 0
-        while packets_received < 10:
+        while packets_received < config.MAX_PACKETS_PER_FRAME:
             try:
-                raw, addr = self.sock.recvfrom(4096)
+                raw, addr = self.sock.recvfrom(config.UDP_BUFFER_SIZE)
                 try:
                     msg = decode(raw)
                     logger.info(f"Auth: Received {msg.__class__.__name__} packet from {addr}")
@@ -520,7 +574,7 @@ class PongClient:
                                 sys.exit(1)
                             
                             # For other errors, we'll retry with a new login
-                            self.last_auth_attempt = time.perf_counter() - 3.0  # Force retry soon
+                            self.last_auth_attempt = time.perf_counter() - config.AUTH_RETRY_INTERVAL  # Force retry soon
                     else:
                         # Let the regular handler take care of other messages
                         self._handle_packet(raw)
@@ -541,7 +595,7 @@ class PongClient:
         self.gui.screen.blit(wait_msg, rect)
         
         # Retry login periodically
-        if time.perf_counter() - self.last_auth_attempt > 2.0 and self.username and self.password_hash:
+        if time.perf_counter() - self.last_auth_attempt > config.AUTH_RETRY_INTERVAL and self.username and self.password_hash:
             logger.info(f"Retrying LOGIN with username {self.username}")
             login_msg = Login(username=self.username, password_hash=self.password_hash)
             self.send(login_msg)
@@ -557,7 +611,7 @@ class PongClient:
     def _send_heartbeat(self):
         """Send periodic heartbeat messages to keep connection alive."""
         time_since_pulse = time.perf_counter() - self.pulse_to_server_time
-        if time_since_pulse > 2.0:
+        if time_since_pulse > config.HEARTBEAT_INTERVAL:
             # If we're authenticated but not in a lobby, or we're in a lobby but not yet assigned a player ID,
             # send a HELLO to help with reconnection
             if self.authenticated and (not self.in_lobby or self.player_id == -1):
@@ -580,14 +634,14 @@ class PongClient:
         elapsed = time.perf_counter() - self.pulse_from_server_time
         
         # Different thresholds based on connection state
-        if elapsed > 8.0:
+        if elapsed > config.CLIENT_SERVER_TIMEOUT:
             # Hard timeout - exit the game
             logger.error(f"Server not responding for {elapsed:.1f} seconds, quitting")
             self.gui.show_game_over("Server not responding... shutting down")
             time.sleep(2)
             pygame.quit()
             sys.exit(1)
-        elif elapsed > 5.0 and self.authenticated:
+        elif elapsed > config.CLIENT_SERVER_WARNING and self.authenticated:
             # Try resetting connection to main server
             logger.warning(f"Server unresponsive for {elapsed:.1f} seconds, attempting reconnection")
             
@@ -618,7 +672,7 @@ class PongClient:
         if self.authenticated and self.player_id == -1 and self.username:
             time_since_hello = time.perf_counter() - self.last_hello_attempt
             logger.debug(f"Time since last HELLO: {time_since_hello:.1f}s")
-            if time_since_hello > 1.0:
+            if time_since_hello > config.HELLO_RETRY_INTERVAL:
                 logger.info(f"Retrying HELLO with username {self.username}")
                 hello = Hello(username=self.username)
                 self.send(hello)
@@ -702,7 +756,7 @@ class PongClient:
         last_paddle_y = self.gui.height / 2 - 30
         
         # Main game loop with consistent frame timing
-        target_fps = 60
+        target_fps = config.CLIENT_TARGET_FPS
         frame_time_target = 1.0 / target_fps
         
         try:
@@ -745,7 +799,7 @@ class PongClient:
             import traceback
             logger.error(traceback.format_exc())
             self.gui.show_game_over(f"Client error: {str(e)}")
-            time.sleep(2)
+            time.sleep(config.UI_GAME_OVER_DISPLAY_TIME)
             pygame.quit()
             sys.exit(1)
 
@@ -754,7 +808,7 @@ class PongClient:
         return hashlib.sha256(password.encode()).hexdigest()
 
 
-def run_client_main(server_ip: str, port: int = 9999):
+def run_client_main(server_ip: str, port: int = config.SERVER_PORT):
     logger.info(f"Starting client connecting to {server_ip}:{port}")
     gui = Gui()
     client = PongClient((server_ip, port), gui=gui)

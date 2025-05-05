@@ -135,10 +135,28 @@ class Denied(BaseMessage):
 @dataclass
 class GameOver(BaseMessage):
     reason: str
+    winner: int = -1  # -1 = no winner (disconnect), 0 = left player, 1 = right player
+    winner_username: str = ""
+    score: str = ""
+    player_username: str = ""
+    opponent_username: str = ""
+    player_games: int = 0
+    player_wins: int = 0
+    player_losses: int = 0
 
-    def __init__(self, reason: str):
+    def __init__(self, reason: str, winner: int = -1, winner_username: str = "", 
+                 score: str = "", player_username: str = "", opponent_username: str = "",
+                 player_games: int = 0, player_wins: int = 0, player_losses: int = 0):
         super().__init__(MessageType.GAME_OVER)
         self.reason = reason
+        self.winner = winner
+        self.winner_username = winner_username
+        self.score = score
+        self.player_username = player_username
+        self.opponent_username = opponent_username
+        self.player_games = player_games
+        self.player_wins = player_wins
+        self.player_losses = player_losses
 
 
 @dataclass

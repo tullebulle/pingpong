@@ -1,7 +1,7 @@
 # Pong Game - Engineering Notebook
 
 ## Project Overview
-For our final porejct, we implemented a multiplayer `Pong' game. Users can create accounts and play against other users selected from a queue of users currently waiting to play. The project includes user authentication, matchmaking, game lobbies, and a real-time physics simulation for the Pong game itself.
+For our final porejct, we implemented a multiplayer `Pong' game. Users can create accounts and play against other users selected from a queue of users currently waiting to play. The project includes user authentication, matchmaking, game lobbies, game statistics, and a real-time physics simulation for the Pong game itself.
 
 ## Communication Protocol and Implementation
 
@@ -13,7 +13,7 @@ Since our Pong game is being player in real-time, we need to optimize for a mini
 
 When considering the specific mechanics of our implementation, we can observe how the game naturally accommodates packet loss in several ways. For instance, if a player's paddle movement input packet is lost during transmission, the resulting momentary discrepancy is quickly remedied when the next input packet arrives a fraction of a second later -- the player might notice a slight hiccup in responsiveness, but the overall gameplay continues uninterrupted. Similarly, if the server's state update packet containing ball position is lost en route to a client, the subsequent update (arriving approximately 16 milliseconds later at 60 updates per second) will correct any visual inconsistencies without meaningful gameplay impact. This inherent resilience is further enhanced by our authoritative server architecture, where the server maintains the "ground truth" of the game state, ensuring that temporary client-side deviations due to packet loss are quickly resolved. We improved this natural tolerance by implementing our tick-based game loop in `server.py`, where each frame represents a discrete advancement of game state, allowing the system to maintain consistency even when individual updates are missed. This stands in stark contrast to TCP, which would delay all subsequent updates until a lost packet is retransmitted -- creating noticeable freezes in the fast-paced gameplay environment where immediate, albeit occasionally imperfect, information is far preferable to delayed perfect information.
 
-### Reliability mechanisms
+## Reliability mechanisms
 
 However, we still need some methods in place to ensure reliability of the communication protocol, for example when a player disconnects. Instead of TCP's one-size-fits-all reliability approach, we use UDP since it allows us to implement reliability mechanisms particularly for our project that address the messaging reliability needs, hopefully without compromising real-time performance. 
 
@@ -41,6 +41,9 @@ We considered several alternative protocols before settling on UDP. TCP would ha
 
 ## System Components and Implementation
 
+### Configuration System (config.py)
+To improve maintainability and eliminate magic numbers throughout the codebase, we implemented a centralized configuration system. This allows easy adjustment of system parameters without modifying code files. Configuration categories include server settings (timeouts, port ranges, packet limits), database parameters (concurrency settings, filename), game physics constants, client behavior settings, and UI configuration. This approach significantly improves code readability and makes the application more adaptable to different deployment scenarios without recompilation.
+
 ### Network Protocol (protocol.py)
 Designing a reliable communication protocol over unreliable UDP presented significant challenges. We created a JSON-based message protocol with a version system for backward compatibility and defined various message types (Hello, Pulse, Welcome, Input, State, etc.) using Python dataclasses. Message encoding/decoding was implemented with comprehensive error handling for malformed packets, and we added heartbeat mechanisms to maintain connection state and detect disconnections.
 
@@ -48,10 +51,17 @@ Designing a reliable communication protocol over unreliable UDP presented signif
 Handling multiple concurrent games and clients efficiently required careful design. We used a multi-process architecture with a central lobby manager process that creates separate game instances for pairs of players. The timeout system we implemented detects and handles disconnected players gracefully, while our port allocation system dynamically assigns game lobbies to different ports, enabling multiple simultaneous games.
 
 ### Game Physics Simulation
-Creating a deterministic physics model that works reliably over a network connection was a significant challenge. We developed a simple but effective physics engine for ball movement and collisions that uses a fixed timestep simulation to ensure consistent behavior across instances. Slight randomization in ball velocity after paddle collisions adds gameplay variety without compromising predictability, and the authoritative server-side physics implementation with client-side prediction creates a responsive UI experience despite network latency.
+Creating a physics model that works reliably over a network connection was a significant challenge. We developed a simple but effective physics engine for ball movement and collisions that uses a fixed timestep simulation to ensure consistent behavior across instances. Slight randomization in the reflection angle after a paddle collisions adds gameplay variety without compromising predictability, and the authoritative server-side physics implementation with client-side prediction creates a responsive UI experience despite network latency.
+
+### Database Management System
+Our application uses SQLite with carefully designed concurrency controls to support multiple simultaneous game processes accessing the database. We implemented Write-Ahead Logging (WAL) mode, which significantly improves concurrency by allowing multiple processes to read and write simultaneously. The system includes explicit transaction management with IMMEDIATE locks to ensure atomicity and reduce race conditions. 
+
+To handle the inevitable database contention in a multi-process environment, we built a robust retry mechanism with exponential backoff for handling database lock errors. Each database operation is wrapped in a retry function that can automatically reattempt operations when it encounters "database is locked" errors. The system is configurable through parameters that control retry count, timeout durations, and backoff behavior.
+
+Our database implementation also includes proper connection management, ensuring connections are properly closed after each operation, and parameterized queries to prevent SQL injection. The database schema is automatically initialized if it doesn't exist, making deployment simpler. To validate our concurrency handling approach, we developed a specialized test suite that simulates multiple processes accessing the database simultaneously, verifying that our implementation maintains data integrity under heavy concurrent loads.
 
 ### User Authentication System
-Securely authenticating users and maintaining persistence between sessions was implemented through a SQLite database that stores user credentials and game statistics. We used standard password hashing techniques for secure authentication and implemented robust session management to maintain authenticated state during gameplay. Statistical tracking for wins, losses, and total games played enhances the user experience and encourages continued engagement.
+Securely authenticating users and maintaining persistence between sessions was implemented through a SQLite database that stores user credentials and game statistics. We used standard password hashing techniques for secure authentication and implemented robust session management to maintain authenticated state during gameplay. 
 
 ### Client Implementation (client.py)
 Creating a responsive UI that gracefully handles network latency required several techniques. We used Pygame for rendering and input handling, implemented client-side prediction to hide network latency, and created input buffering to smooth out player control. The timeout detection system handles server disconnections gracefully, and our UI components for login, gameplay, and player information display create a cohesive user experience.
@@ -59,14 +69,29 @@ Creating a responsive UI that gracefully handles network latency required severa
 ### Lobby and Matchmaking System
 Efficiently pairing players together and managing the game lifecycle presented interesting challenges. We created a matchmaking queue to pair waiting players, implemented a lobby status system (WAITING, ACTIVE, COMPLETED), designed a process monitoring system to clean up completed games and prevent resource leaks, and added redirect functionality to move players from the main server to game lobbies seamlessly.
 
+### Game Ending and Statistics
+The first player to reach 10 points is declared the winner. When this condition is met, the server broadcasts GameOver messages to both players, ensuring a consistent end-of-game experience. The system records each player's performance in the database, tracking games played, wins, and losses for persistent statistics across sessions. The game over screen presents these statistics to players immediately after a match concludes, showing their overall performance record and win percentage.
+
 ## Technical Challenges and Solutions
 
 Despite using UDP, which doesn't guarantee packet delivery, we achieved remarkable reliability through several complementary approaches. Regular heartbeat messages detect disconnections quickly, input sequence numbers handle packet loss and out-of-order delivery gracefully, and our server-side authority with client prediction creates smooth gameplay even with significant network latency or packet loss.
 
 Our server architecture was specifically designed for scalability through separated processes for each game (distributing CPU load), dynamic port allocation for game instances, and automatic resource cleanup for completed games to prevent memory leaks during extended operation.
 
-Security was a primary concern, addressed through password hashing using standard cryptographic functions, thorough input validation to prevent malformed packets from causing issues, and timeout mechanisms to prevent resource exhaustion attacks.
+Security was a primary concern, addressed through password hashing using standard cryptographic functions, input validation to prevent malformed packets from causing issues, and timeout mechanisms to prevent resource exhaustion attacks.
 
+### Configuration Management Strategy
+We replaced all hardcoded constants with references to a centralized configuration module. This approach provides several benefits: it enables quick parameter tuning without code changes, hopefully improves readability by giving meaningful names to constants, simplifies deployment to different environments, and enables future work on dynamic configuration loading. The configuration is logically organized into categories (server, client, database, physics, UI).
+
+### Database Concurrency Strategy
+Another technical challenges was handling database concurrency in a multi-process environment. While SQLite databases are as far as we know not designed for high-concurrency access, our architecture required multiple game processes to simultaneously update player statistics. We solved this with a multi-layered approach:
+
+1. Enabling SQLite's Write-Ahead Logging (WAL) mode, which significantly improves concurrency by allowing reads and writes to occur simultaneously.
+2. Implementing explicit transaction management with BEGIN IMMEDIATE statements to obtain necessary locks as early as possible during write operations.
+3. Creating an error-handling wrapper that automatically retries operations when encountering database locked errors, using exponential backoff between attempts.
+4. Setting appropriate busy timeouts at the SQLite connection level to wait for locks to be released rather than failing immediately.
+
+We validated this approach through a dedicated test suite that simulates multiple processes attempting to update the same player records simultaneously. Our solution achieved near-linear scaling up to the process limits of the hosting hardware, enabling the system to handle dozens of concurrent game sessions without database contention becoming a bottleneck.
 
 ### Error Recovery Strategy
 Our error recovery approach goes beyond simply handling malformed packets. We implemented a layered recovery system where the severity of the error determines the recovery mechanism. For minor issues like a single dropped input packet, the client continues operating with its predicted state until the next server update reconciles any discrepancies. For more severe issues like a series of dropped state updates, the client implements a "dead reckoning" system that continues simulating ball movement based on its last known velocity until fresh server data arrives. If the connection deteriorates further, a progressive degradation occurs: first showing a "connection unstable" warning, then freezing the game state while attempting reconnection, and finally timing out with a graceful shutdown if recovery fails. This graduated approach prevents the jarring experience of an immediate disconnect while maximizing the chances of recovering from transient network issues.
@@ -92,12 +117,18 @@ Our testing strategy went beyond merely writing tests - we integrated them deepl
 ### Client Buffering Strategy
 The client's state management system is more sophisticated than initially described. Rather than simply accepting each server state update as received, the client maintains a rolling buffer of recent states, typically spanning 250ms of gameplay. Incoming state packets are timestamped and inserted into this buffer in correct temporal order, regardless of arrival time. The rendering system then interpolates between the two states surrounding the current "render time" (which intentionally lags behind the latest received state by approximately 100ms). This interpolation buffer absorbs network jitter and packet loss while maintaining smooth animation. For prediction, we actually run a simplified physics simulation on the client that approximates server behavior, with periodic corrections from authoritative updates. When reconciling differences between predicted and actual states, we use a variable-rate correction that applies larger adjustments when the player isn't actively moving their paddle (when players are less likely to notice the correction), creating a seamless experience even under challenging network conditions.
 
-## Future Improvements
+## Future Improvements and Known Limitations
 
-Several enhancements could further improve the system. Adding a spectator mode would allow users to watch ongoing games, enhancing community engagement. Implementing NAT traversal techniques would improve connectivity for users behind restrictive firewalls. Tournament functionality could create more structured competitive play. The game physics could be enhanced with more realistic paddle physics and spin effects for more nuanced gameplay. Finally, the UI could be improved with animations and sound effects to create a more engaging sensory experience.
+### Limitations and Vulnerabilities
+- We only hash the passwords but don't use more advanced techniques (e.g. salting). Also, we have no upper limit for login attempts. Since the stakes of our application are fairly low we believe that this won't be an issue for now. 
+- While our recent database concurrency improvements allow multiple game processes to access the database simultaneously without conflicts, the process-per-game architecture still limits the total number of concurrent games to around 50 on a single server due to operating system process constraints.
 
+### Features we could add
+Several enhancements could further improve the system. Adding a spectator mode would allow users to watch ongoing games. Implementing NAT traversal techniques would improve connectivity for users behind restrictive firewalls. Tournament functionality could create more structured competitive play. The game physics could be enhanced with more realistic paddle physics and spin effects for more nuanced gameplay. Finally, the UI could be improved with animations and sound effects to create a more engaging experience.
 
-### Testing
+We could further enhance the configuration system by implementing dynamic configuration loading, allowing parameters to be changed at runtime or loaded from external files. This would enable operators to tune the system's behavior without restarting services.
+
+## Testing
 We had to make sure everything worked correctly across the network, which is notoriously unpredictable. Our approach was to build tests from the ground up, starting with the basics and gradually testing more complex interactions.
 
 We first tackled the protocol messages - making sure data packets could be properly encoded, sent across the network, and decoded correctly on the other end. This might sound straightforward, but with multiple message types (Hello, Welcome, Input, State), we needed to verify each one maintained its integrity when bouncing between client and server.
@@ -118,4 +149,4 @@ We spent a good amount of time on edge cases too. What happens if a player's con
 ## Attributions
 The game [Pong](https://en.wikipedia.org/wiki/Pong) was developed and popularize by [Atari](https://atari.com/?srsltid=AfmBOoot0ZhkFV5EbJzfy1qfKjW8kWzW0Mg9JQTdNT9AUYnnOQHB51n8).
 
-We used Cursor with Antropic AI to assist us with implement parts of the project and summarizing its features in this notebook.'
+We used [Cursor](https://www.cursor.com/en) with [Antropic AI](https://claude.ai/login?returnTo=%2F%3F) to assist us with implement parts of the project and summarizing its features in this notebook.'

@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 import json
 
+import config
+
 from protocol import (
     Denied,
     Pulse,
@@ -32,13 +34,13 @@ from protocol import (
     decode,
 )
 
-# Constants
+# Constants (now imported from config)
 PLAYER_TIMEOUT = 3.0  # seconds before considering a player disconnected
 LOBBY_PORT_RANGE = (10000, 20000)  # Range of ports to use for game lobbies
 MAX_LOBBIES = 50  # Maximum number of concurrent game lobbies
 
 # Database constants
-DB_FILE = Path(__file__).with_suffix(".db")  # users.db
+DB_FILE = Path(__file__).parent / config.DB_FILENAME
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     username TEXT PRIMARY KEY,
@@ -80,54 +82,111 @@ class ServerDB:
     
     def __init__(self, db_path: str | os.PathLike | None = None):
         self.db_path = Path(db_path) if db_path else DB_FILE
+        
+        # Make sure the parent directory exists
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        
         # Create connection and initialize schema
         with self._get_connection() as conn:
             conn.execute(_SCHEMA)
             conn.commit()
-        print(f"Initialized user database at {self.db_path}")
+        logger.info(f"Initialized user database at {self.db_path}")
 
     def _get_connection(self):
         """Get a new database connection. Always call this instead of reusing connections."""
-        return sqlite3.connect(self.db_path)
+        # Enable WAL mode for better concurrency
+        conn = sqlite3.connect(self.db_path, timeout=20.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        # Set a busy timeout to wait for locks to be released
+        conn.execute(f"PRAGMA busy_timeout = {config.DB_BUSY_TIMEOUT}")
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _execute_with_retry(self, operation, params=(), max_retries=None, retry_delay=None):
+        """Execute a database operation with retry logic for handling database locks."""
+        max_retries = config.DB_MAX_RETRIES if max_retries is None else max_retries
+        retry_delay = config.DB_RETRY_DELAY if retry_delay is None else retry_delay
+        
+        retries = 0
+        while True:
+            try:
+                with self._get_connection() as conn:
+                    result = operation(conn, params)
+                    return result
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e) and retries < max_retries:
+                    retries += 1
+                    logger.warning(f"Database locked, retrying operation ({retries}/{max_retries})")
+                    time.sleep(retry_delay * (2 ** retries))  # Exponential backoff
+                else:
+                    logger.error(f"Database error: {e}")
+                    raise
 
     # --------------------------------------------------- #
     def add_user(self, username: str, password_hash: str) -> None:
-        try:
-            with self._get_connection() as conn:
+        """Add a new user to the database."""
+        def _operation(conn, params):
+            username, password_hash = params
+            try:
                 conn.execute(
                     "INSERT INTO users (username, password_hash) VALUES (?, ?)",
                     (username, password_hash),
                 )
+                conn.commit()
+            except sqlite3.IntegrityError:
+                raise ValueError("Username already exists")
+            
+        try:
+            self._execute_with_retry(_operation, (username, password_hash))
         except sqlite3.IntegrityError:
             raise ValueError("Username already exists")
 
     def verify_user(self, username: str, password_hash: str) -> bool:
-        with self._get_connection() as conn:
+        """Verify user credentials."""
+        def _operation(conn, params):
+            username, password_hash = params
             cur = conn.execute(
                 "SELECT password_hash FROM users WHERE username = ?", (username,)
             )
             row = cur.fetchone()
-        if not row:
-            return False
-        return row[0] == password_hash
+            if not row:
+                return False
+            return row[0] == password_hash
+            
+        return self._execute_with_retry(_operation, (username, password_hash))
 
     # --------------------------------------------------- #
     def record_game(self, username: str, win: bool) -> None:
-        with self._get_connection() as conn:
-            conn.execute(
-                "UPDATE users SET games = games + 1, wins = wins + ?, losses = losses + ? WHERE username = ?",
-                (1 if win else 0, 0 if win else 1, username,),
-            )
+        """Record game outcome for a user with proper transaction handling."""
+        def _operation(conn, params):
+            username, win = params
+            # Use a transaction to ensure atomic update
+            conn.execute("BEGIN IMMEDIATE")  # Get an immediate lock
+            try:
+                conn.execute(
+                    "UPDATE users SET games = games + 1, wins = wins + ?, losses = losses + ? WHERE username = ?",
+                    (1 if win else 0, 0 if win else 1, username),
+                )
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                raise e
+                
+        self._execute_with_retry(_operation, (username, win))
 
     def get_stats(self, username: str) -> Tuple[int, int, int]:
-        with self._get_connection() as conn:
+        """Get user statistics."""
+        def _operation(conn, params):
+            username = params[0]
             cur = conn.execute(
                 "SELECT games, wins, losses FROM users WHERE username = ?", (username,)
             )
             row = cur.fetchone()
-        if row:
-            return int(row[0]), int(row[1]), int(row[2])
-        return (0, 0, 0)
+            if row:
+                return int(row[0]), int(row[1]), int(row[2])
+            return (0, 0, 0)
+            
+        return self._execute_with_retry(_operation, (username,))
 
 @dataclass
 class PlayerSlot:
@@ -141,12 +200,14 @@ class PlayerSlot:
 class GameState:
     """Simple Pong physics simulation (no spin, no acceleration)."""
 
-    # Static dimensions
-    W, H = 640, 480
-    PADDLE_W, PADDLE_H = 10, 60
-    BALL_SZ = 10
-    PADDLE_MARGIN = 0  # x-offset of paddles from edge
-    BALL_SPEED = 300.0  # px/s (initial)
+    # Static dimensions from config
+    W = config.GAME_WIDTH
+    H = config.GAME_HEIGHT
+    PADDLE_W = config.PADDLE_WIDTH
+    PADDLE_H = config.PADDLE_HEIGHT
+    BALL_SZ = config.BALL_SIZE
+    PADDLE_MARGIN = config.PADDLE_MARGIN
+    BALL_SPEED = config.BALL_SPEED
 
     def __init__(self) -> None:
         self.tick: int = 0
@@ -166,7 +227,7 @@ class GameState:
         self.ball_vx = self.BALL_SPEED * direction
         self.ball_vy = self.BALL_SPEED * (random.random() - 0.5)
 
-    def step(self, dt: float) -> None:
+    def step(self, dt: float) -> bool:
         """Advance world simulation by dt seconds."""
         self.ball_x += self.ball_vx * dt
         self.ball_y += self.ball_vy * dt
@@ -202,10 +263,13 @@ class GameState:
             self.scores[0] += 1
             self.reset_ball(direction=-1)
         self.tick += 1
+        
+        # Return True if a player has reached the score limit
+        return self.scores[0] >= config.SCORE_LIMIT or self.scores[1] >= config.SCORE_LIMIT
 
 
 class PongServer:
-    def __init__(self, host: str = "0.0.0.0", port: int = 9999, db_path: str | os.PathLike | None = None, pipe_conn=None, lobby_id: int = -1):
+    def __init__(self, host: str = config.SERVER_HOST, port: int = config.SERVER_PORT, db_path: str | os.PathLike | None = None, pipe_conn=None, lobby_id: int = -1):
         logger.info(f"Initializing game lobby {lobby_id} on {host}:{port}")
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -425,9 +489,9 @@ class PongServer:
     def _process_network_packets(self):
         """Process all pending network packets in the UDP receive buffer."""
         packets_processed = 0
-        while packets_processed < 100:  # Safety limit to prevent infinite loop
+        while packets_processed < config.MAX_PACKETS_PER_FRAME:
             try:
-                data, addr = self.sock.recvfrom(4096)
+                data, addr = self.sock.recvfrom(config.UDP_BUFFER_SIZE)
                 self.handle_packet(data, addr)
                 packets_processed += 1
             except BlockingIOError:
@@ -438,13 +502,13 @@ class PongServer:
         """Check for disconnected players."""
         logger.debug(f"Connected players in Lobby {self.lobby_id}: {[slot.username for slot in self.slots if slot]}")
         for i, slot in enumerate(self.slots):
-            if slot and now - slot.last_pulse_time > PLAYER_TIMEOUT:
+            if slot and now - slot.last_pulse_time > config.PLAYER_TIMEOUT:
                 elapsed = now - slot.last_pulse_time
                 logger.warning(f"Player {i} ({slot.username}) timed out after {elapsed:.1f}s")
                 logger.debug(f"Last pulse time: {slot.last_pulse_time}, current time: {now}")
                 
                 # More lenient: only timeout if it's been a very long time
-                if elapsed < PLAYER_TIMEOUT * 2:
+                if elapsed < config.PLAYER_TIMEOUT * 2:
                     logger.info(f"Giving player {i} extra time before timeout...")
                     continue
                 
@@ -493,21 +557,83 @@ class PongServer:
             return next_tick  # No changes if game isn't running
             
         # Grace period before physics begins
-        if self.start_time and now < self.start_time:
+        if self.start_time and now < self.start_time + config.COUNTDOWN_DURATION:
             # Keep sending neutral state so clients show countdown-like pause
-            logger.debug(f"In grace period, {self.start_time - now:.1f}s remaining")
+            logger.debug(f"In grace period, {self.start_time + config.COUNTDOWN_DURATION - now:.1f}s remaining")
             self.broadcast_state()
             return next_tick
             
         # Grace period just ended
-        if self.start_time is not None:
+        if self.start_time is not None and now >= self.start_time + config.COUNTDOWN_DURATION:
             next_tick = now  # reset so we don't try to catch up
             self.start_time = None
             
         # Time to update physics
         if now >= next_tick:
-            self.game.step(tick_interval)
+            game_over = self.game.step(tick_interval)
             self.broadcast_state()
+            
+            # Check if the game is over (someone reached the score limit)
+            if game_over:
+                winner = 0 if self.game.scores[0] >= config.SCORE_LIMIT else 1
+                loser = 1 if winner == 0 else 0
+                
+                # Get winner's username, or fallback to "Player X" if not available
+                winner_username = self.slots[winner].username if self.slots[winner] and self.slots[winner].username else f"Player {winner}"
+                
+                logger.info(f"Game over: {winner_username} wins with a score of {self.game.scores[0]}-{self.game.scores[1]}")
+                
+                # Record the game results in the database
+                if self.slots[winner] and self.slots[winner].username:
+                    # Record win for winner
+                    self.db.record_game(self.slots[winner].username, win=True)
+                    winner_stats = self.db.get_stats(self.slots[winner].username)
+                    logger.info(f"Updated stats for {self.slots[winner].username}: {winner_stats}")
+                
+                if self.slots[loser] and self.slots[loser].username:
+                    # Record loss for loser
+                    self.db.record_game(self.slots[loser].username, win=False)
+                    loser_stats = self.db.get_stats(self.slots[loser].username)
+                    logger.info(f"Updated stats for {self.slots[loser].username}: {loser_stats}")
+                
+                # Send game over message to both players with stats
+                for slot in self.slots:
+                    if slot:
+                        # Get the player's stats
+                        player_stats = self.db.get_stats(slot.username) if slot.username else (0, 0, 0)
+                        # Get opponent's username
+                        opponent_slot = self.slots[1] if slot.id == 0 else self.slots[0]
+                        opponent_username = opponent_slot.username if opponent_slot else "Unknown"
+                        
+                        # Create a detailed game over message
+                        game_over_msg = GameOver(
+                            reason=f"{winner_username} wins! Final score: {self.game.scores[0]}-{self.game.scores[1]}",
+                            winner=winner,
+                            winner_username=winner_username,
+                            score=f"{self.game.scores[0]}-{self.game.scores[1]}",
+                            player_username=slot.username,
+                            opponent_username=opponent_username,
+                            player_games=player_stats[0],
+                            player_wins=player_stats[1],
+                            player_losses=player_stats[2]
+                        )
+                        self.send(game_over_msg, slot.addr)
+                
+                # Notify parent process
+                if self.pipe_conn:
+                    username = self.slots[winner].username if self.slots[winner] else f"Player {winner}"
+                    self.pipe_conn.send({
+                        "type": "game_over",
+                        "winner": winner,
+                        "winner_username": username,
+                        "score": f"{self.game.scores[0]}-{self.game.scores[1]}"
+                    })
+                    self.status = LobbyStatus.COMPLETED
+                
+                # Reset game state
+                self.game_running = False
+                self.game = GameState()
+            
             next_tick += tick_interval
             
         return next_tick
@@ -533,8 +659,7 @@ class PongServer:
 
     # ------------- main loop ------------- #
     def run(self):
-        TICK_RATE = 60
-        tick_interval = 1.0 / TICK_RATE
+        tick_interval = 1.0 / config.TICK_RATE
         next_tick = time.perf_counter()
         last_timeout_check = time.perf_counter()  # Track last timeout check
         logger.info(f"Game lobby {self.lobby_id} running, waiting for players...")
@@ -585,7 +710,7 @@ def run_lobby_process(host: str, port: int, lobby_id: int, pipe_conn, db_path: s
 class LobbyManager:
     """Manages multiple game lobbies for concurrent Pong games."""
     
-    def __init__(self, host: str = "0.0.0.0", port: int = 9999, db_path: str | os.PathLike | None = None):
+    def __init__(self, host: str = config.SERVER_HOST, port: int = config.SERVER_PORT, db_path: str | os.PathLike | None = None):
         logger.info(f"Initializing lobby manager on {host}:{port}")
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((host, port))
@@ -612,6 +737,11 @@ class LobbyManager:
     def _create_new_lobby(self, first_player: Tuple[str, Tuple[str, int]]) -> int:
         """Create a new game lobby for the waiting player."""
         username, addr = first_player
+        
+        # Check if we've hit the maximum number of lobbies
+        if len(self.lobbies) >= config.MAX_LOBBIES:
+            logger.error(f"Maximum number of lobbies ({config.MAX_LOBBIES}) reached, cannot create more")
+            return -1
         
         # Find an available port
         port = self._find_available_port()
@@ -669,7 +799,7 @@ class LobbyManager:
         # Try random ports from the range
         attempts = 0
         while attempts < 50:  # Limit attempts to avoid infinite loop
-            port = random.randint(LOBBY_PORT_RANGE[0], LOBBY_PORT_RANGE[1])
+            port = random.randint(config.LOBBY_PORT_RANGE[0], config.LOBBY_PORT_RANGE[1])
             
             # Skip if port is already in use by another lobby
             if any(lobby.port == port for lobby in self.lobbies.values()):
@@ -894,14 +1024,14 @@ class LobbyManager:
             # Clean up completed games after a timeout
             if lobby.status == LobbyStatus.COMPLETED:
                 age = now - lobby.creation_time
-                if age > 60:  # 1 minute timeout for cleaning up completed games
+                if age > config.LOBBY_CLEANUP_TIMEOUT:  # Timeout for cleaning up completed games
                     logger.info(f"Cleaning up completed lobby {lobby_id} (age: {age:.1f}s)")
                     lobbies_to_remove.append(lobby_id)
         
         # Clean up lobbies that need removal
         for lobby_id in lobbies_to_remove:
             self._cleanup_lobby(lobby_id)
-    
+            
     def _cleanup_lobby(self, lobby_id):
         """Clean up resources for a lobby that's no longer needed."""
         if lobby_id not in self.lobbies:
@@ -950,7 +1080,7 @@ class LobbyManager:
                 if not hasattr(self, '_last_activity_times'):
                     self._last_activity_times = {}
                 self._last_activity_times[addr] = current_time
-            elif current_time - last_activity > PLAYER_TIMEOUT * 2:
+            elif current_time - last_activity > config.PLAYER_TIMEOUT * 2:
                 # More than double the timeout with no activity - player likely disconnected
                 logger.warning(f"Waiting player {username} at {addr} inactive for {current_time - last_activity:.1f}s, removing")
                 waiting_players_to_remove.append(username)
@@ -1002,7 +1132,7 @@ class LobbyManager:
         while True:
             # Process incoming packets
             try:
-                data, addr = self.sock.recvfrom(4096)
+                data, addr = self.sock.recvfrom(config.UDP_BUFFER_SIZE)
                 self._handle_packet(data, addr)
             except BlockingIOError:
                 # No packets waiting
@@ -1010,12 +1140,12 @@ class LobbyManager:
                 
             # Periodically check lobby status
             now = time.perf_counter()
-            if now - last_check_time > 1.0:  # Check every second
+            if now - last_check_time > config.LOBBY_STATUS_CHECK_INTERVAL:
                 self._check_lobby_status()
                 last_check_time = now
                 
             # Check for inactive waiting players less frequently
-            if now - last_waiting_check_time > 5.0:  # Check every 5 seconds
+            if now - last_waiting_check_time > config.WAITING_PLAYER_CHECK_INTERVAL:
                 self._check_waiting_players()
                 last_waiting_check_time = now
                 
@@ -1023,7 +1153,7 @@ class LobbyManager:
             time.sleep(0.001)
 
 
-def run_server_main(port: int = 9999):
+def run_server_main(port: int = config.SERVER_PORT):
     logger.info(f"Starting lobby manager on port {port}")
     manager = LobbyManager(port=port)
     manager.run() 
